@@ -1,0 +1,10 @@
+daemon/build_core.log
+daemon/n64play_gl
+daemon/nx-gl/
+daemon/nx.tar.gz
+daemon/nx.tar.gz.sha256.fetched
+daemon/*.o
+.DS_Store
+*.log
+n64.zip
+out/

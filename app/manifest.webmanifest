@@ -1,0 +1,36 @@
+{
+ "name": "N64",
+ "short_name": "N64",
+ "id": "n64",
+ "version": "1.0.5",
+ "description": "Nintendo 64 emulator (GPU, 60 fps on TCL Flip 4)",
+ "start_url": "/index.html",
+ "scope": "/",
+ "display": "standalone",
+ "fullscreen": true,
+ "icons": [
+  {
+   "src": "/icon.png",
+   "sizes": "56x56",
+   "type": "image/png"
+  }
+ ],
+ "b2g_features": {
+  "origin": "n64",
+  "core": true,
+  "developer": {
+   "name": "omp"
+  },
+  "permissions": {
+   "wakeLock": {
+    "description": "keep the screen on while playing"
+   },
+   "power": {
+    "description": "hold the screen wake lock while playing"
+   },
+   "vibration": {
+    "description": "game feedback"
+   }
+  }
+ }
+}

@@ -1,0 +1,27 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<meta name="theme-color" content="#000000">
+<title>N64</title>
+<link rel="stylesheet" href="style.css?v=1.0.5">
+</head><body>
+
+<!-- No editable element on purpose. While a text field holds focus the KaiOS
+     keyboard app owns the dialer keys: it inserts IME text ("a", "d", ".") over
+     the game and swallows arrow keys. ompterm's working game mode has no
+     focused field either; plain keydown/keyup on the window deliver every key
+     (n64.log confirms menu keys arrive with activeElement == body). -->
+
+<div id="menu">
+  <div id="mtitle">N64<span id="mver"></span></div>
+  <div id="mhint">OK play &#183; &#42; reload &#183; Back exit</div>
+  <div id="mlist"></div>
+</div>
+
+<div id="game">
+  <canvas id="gc" width="240" height="320"></canvas>
+  <div id="gstat">&#8230;</div>
+</div>
+
+<script src="n64.js?v=1.0.5"></script>
+</body></html>
