@@ -70,7 +70,7 @@ upright) — the picture is rotated for that grip and the arrow cross follows it
 | `7` / `9` | C-left / C-right | rotate camera |
 | `*` | L | camera recentre |
 | OK | Start | |
-| `0` | | sound on/off (**starts enabled**) |
+| `0` | | sound on/off (**starts muted**) |
 | Back | | stop the game, back to the ROM list |
 
 Keys are read from `keydown`/`keyup` only, and a pad bit stays set until its key
@@ -108,11 +108,12 @@ a key for them, so the latch described above does not apply.
 
 ### Sound
 
-Sound is **on from launch**: tapping a ROM is the only user gesture Gecko
-accepts, so the app creates its `AudioContext` there and sends `A1` as soon as
-the socket opens; the daemon answers with PCM (735 stereo frames per batch,
-`MDA` + 4-byte header). `0` toggles at any time — the app sends `A0`/`A1` on the
-live socket, and a muted session receives no audio frames at all.
+Sound starts **muted** (v1.0.8): the loading screen is the most fragile part of
+a session and PCM is the one thing it does not need. Press `0` in-game to turn it
+on — that keydown is the user gesture Gecko wants, so the `AudioContext` is
+created there, and the app sends `A1` on the live socket; `0` again sends `A0`,
+which makes the daemon stop producing PCM entirely (735 stereo frames per batch,
+`MDA` + 4-byte header, while on).
 
 Audio never blocks video. The daemon writes every socket message non-blocking
 and keeps two drop-oldest queues (a single video-frame slot and a 512 KiB PCM
@@ -256,13 +257,13 @@ default mapping, so the frontend feeds that device from pad bits 12–15.
 
 | symptom | cause / fix |
 |---|---|
-| `connecting…` ends in `NO LINK` | the app retries the socket 8 x 900 ms (the daemon needs a few seconds to spawn); `grep "ws drop" /data/local/tmp/n64.log` shows why a live link ended (`1006` = torn down by the system, not the app). If the daemon never appears, check `pidof n64play_gl` |
+| stuck on `connecting…` | the app retries forever while the game screen is up (the daemon boots the ROM before it listens, and a dead or slow link resumes when it comes back). `grep -E "retry \|ws drop" /data/local/tmp/n64.log` shows the attempt count and why a live link ended (`1006` = torn down by the system, not the app). If it never connects, check `pidof n64play_gl` and `pidof n64svc` |
 | ROM list says "Service not running" | helper not up: `adb shell '/data/local/n64/n64svc 8090 /data/media/roms &'`, or reboot (boot hook) |
 | app not in the launcher | re-run `./install.sh` (registers the app and restarts b2g) |
 | keys do nothing | check `gk …->bit` lines in `n64.log`; the window must have focus (a system overlay steals it — the app releases all held bits on `blur`) |
 | arrows move Mario only a step | every bit is held until `keyup`, so a hold walks; if the log shows one `gk ArrowUp->6` per press but Mario stops early, a stuck keyup came from an overlay — tap Back and reopen |
 | low fps | check the daemon log; fps is limited by the N64 (60 Hz); if `run=` is large, another app is competing for CPU |
-| no sound | check `grep -E "audio rate|no AudioContext" /data/local/tmp/n64.log`: `no AudioContext` means the gesture rule blocked it — reopen the game from the ROM list; `soundOn` toggling logs nothing, so press `0` twice and re-check the daemon for `audio on` |
+| no sound | it starts muted — press `0` (the daemon logs `n64play: audio on` and the app logs `sound on`); `no AudioContext` in `n64.log` means Gecko refused the context, so tap `0` again after a key press |
 | screen dims after ~15 s | wake lock not held: check `grep wakelock /data/local/tmp/n64.log`; re-run `./install.sh` (grants `wakeLock`/`power`) and restart the app |
 | sound crackles / drops | daemon log shows `adrop=` growing: the phone is behind the stream, so old PCM is discarded on purpose (the game keeps running); `vdrop=` growing means whole frames are being skipped for the same reason |
 

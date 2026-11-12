@@ -2,7 +2,7 @@
  "name": "N64",
  "short_name": "N64",
  "id": "n64",
- "version": "1.0.7",
+ "version": "1.0.8",
  "description": "Nintendo 64 emulator (GPU, 60 fps on TCL Flip 4)",
  "start_url": "/index.html",
  "scope": "/",

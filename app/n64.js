@@ -21,12 +21,11 @@
   'use strict';
   var API = 'http://127.0.0.1:8090';
   var EWS = 'ws://127.0.0.1:8081/';
-  var VER = '1.0.7';                 /* pack.sh rewrites to manifest version */
+  var VER = '1.0.8';                 /* pack.sh rewrites to manifest version */
 
   var menuEl, listEl, gameEl, gstat, cv, ctx;
   var mode = 'menu';
-  var ws = null, connectTimer = 0, tries = 0;
-  var APPTRIES = 8;                   /* 8 x 900 ms: enough for n64svc to spawn the daemon */
+  var ws = null, connectTimer = 0, fails = 0;
   var rom = '', roms = [];
   var lut = null, img = null, u32 = null;
   var CW = 240, CH = 320;
@@ -96,7 +95,7 @@
 
   function startRom(name) {
     rom = name;
-    tries = 0;
+    fails = 0;
     attached = 0;
     autoCancel();
     mode = 'game';
@@ -107,12 +106,12 @@
     if (soundOn) ensureAudio(gSr);
     setStatus('starting ' + shortName() + '…', true);
     /* Poll for the socket instead of waiting for /start to resolve: n64svc only
-     * answers after it has spawned the daemon, and that answer can arrive
-     * minutes later — scheduling connect() from it used to close the live socket
-     * mid-game (client gone -> six dead retries -> NO LINK). */
+     * answers after it has spawned the daemon (which boots the ROM before it
+     * listens), and that answer can arrive minutes later — scheduling connect()
+     * from it used to close the live socket mid-game. */
     api('/start?rom=' + encodeURIComponent(name))
       .catch(function (e) { log('start fail ' + e); });
-    connectTimer = setTimeout(function () { connect(APPTRIES); }, 2000);
+    connectTimer = setTimeout(connect, 2000);
   }
 
   /* One attempt at a time, always tracked by identity: a socket that is still
@@ -121,10 +120,9 @@
    * CONNECTING socket silently ("can't establish a connection", no onopen), so
    * a second connect() used to kill the attempt that was about to succeed and
    * the ladder never recovered. */
-  function connect(n) {
+  function connect() {
     if (mode !== 'game') return;
     if (ws && ws.readyState <= 1) return;      /* CONNECTING or OPEN: hands off */
-    tries = n;
     clearTimeout(connectTimer);
     var s;
     try { s = new WebSocket(EWS); }
@@ -137,6 +135,7 @@
     s.onopen = function () {
       if (ws !== s) { try { s.close(); } catch (e) {} return; }
       s.opened = true;
+      fails = 0;
       clearTimeout(connectTimer);
       frames = 0; statT = Date.now(); pad = 0; lastMsgT = 0;
       try { s.send(new Uint8Array(2)); s.send(soundOn ? 'A1' : 'A0'); } catch (e) {}
@@ -163,22 +162,24 @@
       ws = null;
       try { s.onclose = null; s.onmessage = null; s.onerror = null; s.close(); } catch (e) {}
       retry('connect timeout');
-    }, 4000);
+    }, 6000);
   }
 
+  /* Never give up while the game screen is up: the daemon boots the ROM before
+   * it starts listening, so the first attempts are legitimately refused, and a
+   * link that dies mid-game resumes the game that is still running in the
+   * daemon. Back always leaves. */
   function retry(why) {
     if (mode !== 'game') return;
     clearTimeout(connectTimer);
     var s = ws;
     ws = null;
     if (s) { try { s.onclose = null; s.onmessage = null; s.onopen = null; s.close(); } catch (e) {} }
-    if (tries > 0) {
-      setStatus('connecting… ' + tries);
-      connectTimer = setTimeout(function () { connect(tries - 1); }, 900);
-      return;
-    }
-    setStatus('NO LINK — Back to menu', true);
-    log('connect failed ' + why);
+    fails++;
+    if (fails === 1 || fails % 10 === 0) log('retry ' + fails + ' ' + why);
+    if (fails <= 12) setStatus('connecting… ' + fails);
+    else setStatus('no link — retrying (Back quits)', true);
+    connectTimer = setTimeout(connect, 900);
   }
 
   function leaveGame() {
@@ -378,12 +379,11 @@
   /* --------------------------------------------------------------- audio */
   var actx = null, aproc = null, aGain = null;
   var aq = null, acapF = 0, aqWf = 0, aqRf = 0, ffrac = 0, armed = false;
-  /* Sound is on at every launch: the AudioContext is created from the ROM tap
-   * (the only gesture Gecko accepts) and 'A1' goes out on every socket open.
-   * Key '0' toggles it. The 1.0.1 "start muted because PCM stalls the boot"
-   * rule was wrong: the stall was socket backpressure, fixed on both sides in
-   * v1.0.6 (see README § Sound). */
-  var gSr = 44100, soundOn = true, acDiag = 0;
+  /* Sound starts OFF (user request, v1.0.8): the loading screen is the most
+   * fragile moment of the session and PCM is the last thing it needs. Key '0'
+   * toggles it; AudioContext creation happens inside that keydown, which is a
+   * user gesture, so nothing audio-related runs during a boot. */
+  var gSr = 44100, soundOn = false, acDiag = 0;
 
   function availF() { return (aqWf - aqRf + acapF) % acapF; }
 
