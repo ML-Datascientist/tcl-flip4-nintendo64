@@ -21,7 +21,7 @@
   'use strict';
   var API = 'http://127.0.0.1:8090';
   var EWS = 'ws://127.0.0.1:8081/';
-  var VER = '1.0.5';                 /* pack.sh rewrites to manifest version */
+  var VER = '1.0.6';                 /* pack.sh rewrites to manifest version */
 
   var menuEl, listEl, gameEl, gstat, cv, ctx;
   var mode = 'menu';
@@ -102,6 +102,8 @@
     document.body.className = 'playing';
     wakelock(true);
     sysbar(true);
+    /* click gesture: the only place Gecko lets us create an AudioContext */
+    if (soundOn) ensureAudio(gSr);
     setStatus('starting ' + shortName() + '…', true);
     api('/start?rom=' + encodeURIComponent(name))
       .catch(function (e) { log('start fail ' + e); })
@@ -111,6 +113,10 @@
   function connect(n) {
     if (mode !== 'game') return;
     tries = n;
+    if (ws) {                       /* never leave an older socket behind */
+      try { ws.onclose = null; ws.onmessage = null; ws.onopen = null; ws.close(); } catch (e) {}
+      ws = null;
+    }
     try { ws = new WebSocket(EWS); }
     catch (e) { retry('ws failed'); return; }
     ws.binaryType = 'arraybuffer';
@@ -130,7 +136,9 @@
 
   function retry(why) {
     if (mode !== 'game') return;
+    if (ws) { try { ws.onclose = null; ws.close(); } catch (e) {} }
     ws = null;
+    clearTimeout(connectTimer);
     if (tries > 0) {
       setStatus('connecting… ' + tries);
       connectTimer = setTimeout(function () { connect(tries - 1); }, 900);
@@ -269,7 +277,16 @@
     }
   }
 
+  /* A main-thread stall is invisible in the old log: the app just stops reading
+   * and the daemon times out after 6 s. Log the gap instead. */
+  var lastMsgT = 0, lagLogged = 0;
   function onMsg(ev) {
+    var t = Date.now();
+    if (lastMsgT && t - lastMsgT > 1200 && lagLogged < 5) {
+      lagLogged++;
+      log('lag ' + (t - lastMsgT) + 'ms');
+    }
+    lastMsgT = t;
     try { onMsg1(ev); } catch (e) { log('msg err ' + e); }
   }
   function onMsg1(ev) {
@@ -328,10 +345,12 @@
   /* --------------------------------------------------------------- audio */
   var actx = null, aproc = null, aGain = null;
   var aq = null, acapF = 0, aqWf = 0, aqRf = 0, ffrac = 0, armed = false;
-  /* Muted at every launch: the audio stream is what stalls the emulator while
-   * a ROM boots (streaming PCM competes with the core's own init), so sound is
-   * opt-in per session with key '0'. */
-  var gSr = 44100, soundOn = false, acDiag = 0;
+  /* Sound is on at every launch: the AudioContext is created from the ROM tap
+   * (the only gesture Gecko accepts) and 'A1' goes out on every socket open.
+   * Key '0' toggles it. The 1.0.1 "start muted because PCM stalls the boot"
+   * rule was wrong: the stall was socket backpressure, fixed on both sides in
+   * v1.0.6 (see README § Sound). */
+  var gSr = 44100, soundOn = true, acDiag = 0;
 
   function availF() { return (aqWf - aqRf + acapF) % acapF; }
 
@@ -364,7 +383,7 @@
       aproc.onaudioprocess = function (ev) {
         var L = ev.outputBuffer.getChannelData(0), R = ev.outputBuffer.getChannelData(1);
         var n = L.length, i;
-        if (!soundOn || actx.state !== 'running') {
+        if (!actx || !soundOn || actx.state !== 'running') {
           for (i = 0; i < n; i++) { L[i] = 0; R[i] = 0; }
           return;
         }
@@ -405,15 +424,22 @@
     } catch (e) { actx = null; log('audio init fail ' + e); }
   }
 
+  /* One Int16Array view per message instead of two DataView.getInt16 calls per
+   * sample: 88 k samples/s on a Cortex-A53 is the difference between "audio is
+   * free" and "the main thread falls behind the video stream" (which used to
+   * end in a 6 s socket stall). Room for the new samples is made in O(1) by
+   * advancing the read cursor, never by a per-sample check. */
   function onAudio(dv) {
     if (!aq || !soundOn) return;
-    var n = (dv.byteLength - 4) >> 2, i;
-    for (i = 0; i < n; i++) {
-      var o = aqWf * 2;
-      aq[o] = dv.getInt16(4 + i * 4, true) / 32768;
-      aq[o + 1] = dv.getInt16(6 + i * 4, true) / 32768;
-      aqWf++; if (aqWf >= acapF) aqWf = 0;
-      if (availF() >= acapF - 2048) { aqRf = (aqWf + 1) % acapF; ffrac = 0; }
+    var n = (dv.byteLength - 4) >> 2, i, o;
+    if (n <= 0) return;
+    var room = acapF - availF();
+    if (n > room) { aqRf = (aqRf + (n - room)) % acapF; ffrac = 0; }
+    var s = new Int16Array(dv.buffer, dv.byteOffset + 4, n * 2);
+    for (i = 0, o = aqWf * 2; i < n; i++) {
+      aq[o++] = s[i + i] * 3.0517578125e-05;
+      aq[o++] = s[i + i + 1] * 3.0517578125e-05;
+      if (++aqWf >= acapF) { aqWf = 0; o = 0; }
     }
   }
 

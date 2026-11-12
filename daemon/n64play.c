@@ -171,6 +171,62 @@ static int put_all(int fd, const void *buf, size_t n)
    }
    return 0;
 }
+/* Everything the phone has to drain (video frames, PCM) goes through a
+ * non-blocking write: a stalled app main thread (GC, audio device start-up) must
+ * cost frames, never the session. The app used to lose the link exactly here:
+ * put_all() blocked 6 s on a full socket, the session was dropped and the six
+ * reconnect attempts hit a daemon that had not finished the previous write.
+ * Returns bytes written (0 = socket full), or -1 on a real error. */
+static ssize_t send_some(int fd, const void *buf, size_t n)
+{
+   const uint8_t *p = (const uint8_t *)buf;
+   size_t done = 0;
+   while (done < n) {
+      ssize_t r = send(fd, p + done, n - done, MSG_NOSIGNAL | MSG_DONTWAIT);
+      if (r > 0) { done += (size_t)r; continue; }
+      if (r < 0 && errno == EINTR) continue;
+      if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+      return -1;
+   }
+   return (ssize_t)done;
+}
+
+/* ------------------------------------------------------------ out queues */
+#define VIDQCAP (10 + 8 + 640 * 576 * 2)
+static uint8_t  g_vq[VIDQCAP];
+static size_t   g_vq_len, g_vq_off;
+static unsigned g_vdrop;              /* video frames dropped: socket full */
+#define AUDQCAP (512 * 1024)
+static uint8_t *g_aq;
+static size_t   g_aq_head, g_aq_tail;
+static unsigned g_adrop;              /* audio batches dropped: queue full */
+
+/* Video has to stay in one piece (a partial WS message corrupts the stream),
+ * so it is built in g_vq and drained from g_vq_off. Audio is its own byte queue
+ * and only starts moving once no video message is half-written. */
+static int out_flush(int fd)
+{
+   if (g_vq_off < g_vq_len) {
+      ssize_t r = send_some(fd, g_vq + g_vq_off, g_vq_len - g_vq_off);
+      if (r < 0) return -1;
+      g_vq_off += (size_t)r;
+      if (g_vq_off >= g_vq_len) g_vq_off = g_vq_len = 0;
+   }
+   while (!g_vq_len && g_aq_tail > g_aq_head) {
+      ssize_t r = send_some(fd, g_aq + g_aq_head, g_aq_tail - g_aq_head);
+      if (r < 0) return -1;
+      if (!r) break;
+      g_aq_head += (size_t)r;
+   }
+   if (g_aq_head == g_aq_tail) g_aq_head = g_aq_tail = 0;
+   else if (g_aq_head > AUDQCAP / 2) {
+      memmove(g_aq, g_aq + g_aq_head, g_aq_tail - g_aq_head);
+      g_aq_tail -= g_aq_head;
+      g_aq_head = 0;
+   }
+   return 0;
+}
+
 static int get_line(int fd, char *line, int max)
 {
    int n = 0;
@@ -203,7 +259,6 @@ static char g_srm_path[560];
 static int  g_srm_ready;
 static unsigned g_audio_dropped;
 static int      g_wsc = -1;
-static int      g_audio_err;
 static int      g_audio_on = 1;
 static int      g_probe;              /* N64PROBE=1 */
 static int      g_gl_mode = 1;        /* 1=GLideN64 GPU RDP, 0=angrylion */
@@ -305,11 +360,15 @@ static size_t cb_audio_batch(const int16_t *samples, size_t count)
    g_audio_dropped += count;
    if (g_wsc >= 0 && g_audio_on && !g_nows && count && count < 16000) {
       uint64_t payload = 4 + count * 4;
+      size_t need = (size_t)payload + 4;
       uint8_t hdr[4] = { 0x82, 0x7e, (uint8_t)(payload >> 8), (uint8_t)payload };
       uint8_t tag[4] = { 'M','D','A',0 };
       if (payload >= 65536) return count;
-      if (put_all(g_wsc, hdr, 4) || put_all(g_wsc, tag, 4) || put_all(g_wsc, samples, count * 4))
-         g_audio_err = 1;
+      if (!g_aq) g_aq = malloc(AUDQCAP);
+      if (!g_aq || AUDQCAP - g_aq_tail < need) { g_adrop++; return count; }
+      memcpy(g_aq + g_aq_tail, hdr, 4);             g_aq_tail += 4;
+      memcpy(g_aq + g_aq_tail, tag, 4);             g_aq_tail += 4;
+      memcpy(g_aq + g_aq_tail, samples, count * 4); g_aq_tail += (size_t)count * 4;
    }
    return count;
 }
@@ -567,23 +626,26 @@ static int ws_send_text(int c, const char *s)
 
 static int ws_send_frame(int c)
 {
-   uint8_t ws[10];
-   uint8_t md[8] = { 'M','D','1',0, (uint8_t)(g_fb_w >> 8), (uint8_t)g_fb_w, (uint8_t)(g_fb_h >> 8), (uint8_t)g_fb_h };
    uint64_t pixels = (uint64_t)g_fb_pitch * g_fb_h;
    uint64_t total = pixels + 8;
    int i;
-   if (!g_fb_w || !g_fb_h) return 0;
-   ws[0] = 0x82; ws[1] = 0x7f;
-   for (i = 0; i < 8; i++) ws[2 + i] = (uint8_t)(total >> (56 - 8 * i));
-   if (g_nows) return 0;
+   if (!g_fb_w || !g_fb_h || g_nows) return 0;
+   if (g_vq_len) { g_vdrop++; return 0; }      /* previous frame still in flight */
+   if (18 + pixels > sizeof(g_vq)) return 0;
+   g_vq[0] = 0x82; g_vq[1] = 0x7f;
+   for (i = 0; i < 8; i++) g_vq[2 + i] = (uint8_t)(total >> (56 - 8 * i));
+   g_vq[10] = 'M'; g_vq[11] = 'D'; g_vq[12] = '1'; g_vq[13] = 0;
+   g_vq[14] = (uint8_t)(g_fb_w >> 8); g_vq[15] = (uint8_t)g_fb_w;
+   g_vq[16] = (uint8_t)(g_fb_h >> 8); g_vq[17] = (uint8_t)g_fb_h;
    if (g_fb_dummy) {
-      uint8_t tiny[16] = { 'M','D','1',0,0,0,0,0, 0,0,0,0,0,0,0,0 };
-      if (put_all(c, ws, 10)) return -1;
-      return put_all(c, tiny, 16);
+      memset(g_vq + 18, 0, 16);
+      g_vq_len = 34;
+   } else {
+      memcpy(g_vq + 18, g_fb, (size_t)pixels);
+      g_vq_len = 18 + (size_t)pixels;
    }
-   if (put_all(c, ws, 10)) return -1;
-   if (put_all(c, md, 8)) return -1;
-   return put_all(c, g_fb, (size_t)pixels);
+   g_vq_off = 0;
+   return out_flush(c);
 }
 
 static uint8_t g_acc[4096];
@@ -659,8 +721,9 @@ static int session(int c)
    g_acclen = 0;
    g_pad = 0;
    g_wsc = c;
-   g_audio_on = 1;
-   g_audio_err = 0;
+   g_audio_on = 1;                 /* the app sends A0/A1 right after open */
+   g_vq_len = g_vq_off = 0;
+   g_aq_head = g_aq_tail = 0;
    t0 = fps_t = now_us();
    {
       int64_t period = (int64_t)(1000000.0 / g_av_fps + 0.5);
@@ -672,27 +735,27 @@ static int session(int c)
             retro_run();
             acc_run += now_us() - r0;
          }
-         if (g_audio_err) { LOG("n64play: audio send failed at it=%ld", (long)it); g_wsc = -1; return -1; }
          PROBE("B-run");
          if (g_frame_ready) {
             int64_t s0;
             g_frame_ready = 0;
             s0 = now_us();
-            if (ws_send_frame(c)) { LOG("n64play: send failed at it=%ld", (long)it); g_wsc = -1; return -1; }
+            if (ws_send_frame(c) < 0) { LOG("n64play: send failed at it=%ld", (long)it); g_wsc = -1; return -1; }
             acc_send += now_us() - s0;
             frames++;
          }
+         if (out_flush(c) < 0) { LOG("n64play: send failed at it=%ld", (long)it); g_wsc = -1; return -1; }
          acc_n++;
          it++;
          if (it <= 3 || it % 30 == 0) {
             int64_t nw = now_us();
             double fel = (nw - fps_t) / 1e6;
-            LOG("n64play: it=%ld frames=%ld fps=%.1f w=%u h=%u el=%.2fs audio_batch=%u run=%.1fms cap=%.1fms send=%.1fms",
+            LOG("n64play: it=%ld frames=%ld fps=%.1f w=%u h=%u el=%.2fs audio_batch=%u run=%.1fms cap=%.1fms send=%.1fms vdrop=%u adrop=%u",
                 (long)it, (long)frames, fel > 0 ? frames / fel : 0.0, g_fb_w, g_fb_h,
                 (nw - t0) / 1e6, g_audio_dropped,
                 acc_n ? acc_run / 1000.0 / acc_n : 0.0,
                 acc_n ? (g_cap_us - acc_cap) / 1000.0 / acc_n : 0.0,
-                acc_n ? acc_send / 1000.0 / acc_n : 0.0);
+                acc_n ? acc_send / 1000.0 / acc_n : 0.0, g_vdrop, g_adrop);
             acc_cap = g_cap_us;
             acc_run = acc_send = acc_n = 0;
             fps_t = nw; frames = 0;

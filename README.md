@@ -70,7 +70,7 @@ upright) — the picture is rotated for that grip and the arrow cross follows it
 | `7` / `9` | C-left / C-right | rotate camera |
 | `*` | L | camera recentre |
 | OK | Start | |
-| `0` | | sound on/off (**starts muted**) |
+| `0` | | sound on/off (**starts enabled**) |
 | Back | | stop the game, back to the ROM list |
 
 Keys are read from `keydown`/`keyup` only, and a pad bit stays set until its key
@@ -108,11 +108,19 @@ a key for them, so the latch described above does not apply.
 
 ### Sound
 
-Every launch starts **muted**. Streaming PCM while a ROM boots competes with the
-core's own initialisation (the same build loads noticeably slower and can stall
-in the loading screen with audio on), so audio is opt-in: press `0` in-game to
-enable it, `0` again to mute. The app tells the daemon with `A0`/`A1`; a muted
-session sends no audio frames at all.
+Sound is **on from launch**: tapping a ROM is the only user gesture Gecko
+accepts, so the app creates its `AudioContext` there and sends `A1` as soon as
+the socket opens; the daemon answers with PCM (735 stereo frames per batch,
+`MDA` + 4-byte header). `0` toggles at any time — the app sends `A0`/`A1` on the
+live socket, and a muted session receives no audio frames at all.
+
+Audio never blocks video. The daemon writes every socket message non-blocking
+and keeps two drop-oldest queues (a single video-frame slot and a 512 KiB PCM
+ring): if the app falls behind, the newest frame replaces the pending one and
+old PCM is discarded (`vdrop=`/`adrop=` in the daemon log) instead of the daemon
+blocking on a full socket buffer and losing the session. The app decodes each
+batch with one `Int16Array` view over the received buffer and keeps O(1) ring
+bookkeeping, so a slow renderer costs dropped audio, not a dropped link.
 
 ### Screen timeout
 
@@ -253,9 +261,9 @@ default mapping, so the frontend feeds that device from pad bits 12–15.
 | keys do nothing | check `gk …->bit` lines in `n64.log`; the window must have focus (a system overlay steals it — the app releases all held bits on `blur`) |
 | arrows move Mario only a step | every bit is held until `keyup`, so a hold walks; if the log shows one `gk ArrowUp->6` per press but Mario stops early, a stuck keyup came from an overlay — tap Back and reopen |
 | low fps | check the daemon log; fps is limited by the N64 (60 Hz); if `run=` is large, another app is competing for CPU |
-| no sound | press `0`; audio starts on the first key press (Gecko needs a gesture) |
+| no sound | check `grep -E "audio rate|no AudioContext" /data/local/tmp/n64.log`: `no AudioContext` means the gesture rule blocked it — reopen the game from the ROM list; `soundOn` toggling logs nothing, so press `0` twice and re-check the daemon for `audio on` |
 | screen dims after ~15 s | wake lock not held: check `grep wakelock /data/local/tmp/n64.log`; re-run `./install.sh` (grants `wakeLock`/`power`) and restart the app |
-| sound never starts | it starts muted by design — press `0` once (the daemon logs `n64play: audio on`) |
+| sound crackles / drops | daemon log shows `adrop=` growing: the phone is behind the stream, so old PCM is discarded on purpose (the game keeps running); `vdrop=` growing means whole frames are being skipped for the same reason |
 
 ---
 
