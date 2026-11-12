@@ -256,6 +256,7 @@ default mapping, so the frontend feeds that device from pad bits 12–15.
 
 | symptom | cause / fix |
 |---|---|
+| `connecting…` ends in `NO LINK` | the app retries the socket 8 x 900 ms (the daemon needs a few seconds to spawn); `grep "ws drop" /data/local/tmp/n64.log` shows why a live link ended (`1006` = torn down by the system, not the app). If the daemon never appears, check `pidof n64play_gl` |
 | ROM list says "Service not running" | helper not up: `adb shell '/data/local/n64/n64svc 8090 /data/media/roms &'`, or reboot (boot hook) |
 | app not in the launcher | re-run `./install.sh` (registers the app and restarts b2g) |
 | keys do nothing | check `gk …->bit` lines in `n64.log`; the window must have focus (a system overlay steals it — the app releases all held bits on `blur`) |

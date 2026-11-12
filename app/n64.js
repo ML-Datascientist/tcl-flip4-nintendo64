@@ -21,11 +21,12 @@
   'use strict';
   var API = 'http://127.0.0.1:8090';
   var EWS = 'ws://127.0.0.1:8081/';
-  var VER = '1.0.6';                 /* pack.sh rewrites to manifest version */
+  var VER = '1.0.7';                 /* pack.sh rewrites to manifest version */
 
   var menuEl, listEl, gameEl, gstat, cv, ctx;
   var mode = 'menu';
   var ws = null, connectTimer = 0, tries = 0;
+  var APPTRIES = 8;                   /* 8 x 900 ms: enough for n64svc to spawn the daemon */
   var rom = '', roms = [];
   var lut = null, img = null, u32 = null;
   var CW = 240, CH = 320;
@@ -105,40 +106,72 @@
     /* click gesture: the only place Gecko lets us create an AudioContext */
     if (soundOn) ensureAudio(gSr);
     setStatus('starting ' + shortName() + '…', true);
+    /* Poll for the socket instead of waiting for /start to resolve: n64svc only
+     * answers after it has spawned the daemon, and that answer can arrive
+     * minutes later — scheduling connect() from it used to close the live socket
+     * mid-game (client gone -> six dead retries -> NO LINK). */
     api('/start?rom=' + encodeURIComponent(name))
-      .catch(function (e) { log('start fail ' + e); })
-      .then(function () { connectTimer = setTimeout(function () { connect(6); }, 2500); });
+      .catch(function (e) { log('start fail ' + e); });
+    connectTimer = setTimeout(function () { connect(APPTRIES); }, 2000);
   }
 
+  /* One attempt at a time, always tracked by identity: a socket that is still
+   * CONNECTING or already OPEN is left alone, and an event from a socket that
+   * is no longer current can never close its successor. Gecko closes a
+   * CONNECTING socket silently ("can't establish a connection", no onopen), so
+   * a second connect() used to kill the attempt that was about to succeed and
+   * the ladder never recovered. */
   function connect(n) {
     if (mode !== 'game') return;
+    if (ws && ws.readyState <= 1) return;      /* CONNECTING or OPEN: hands off */
     tries = n;
-    if (ws) {                       /* never leave an older socket behind */
-      try { ws.onclose = null; ws.onmessage = null; ws.onopen = null; ws.close(); } catch (e) {}
-      ws = null;
-    }
-    try { ws = new WebSocket(EWS); }
+    clearTimeout(connectTimer);
+    var s;
+    try { s = new WebSocket(EWS); }
     catch (e) { retry('ws failed'); return; }
-    ws.binaryType = 'arraybuffer';
-    ws.onmessage = onMsg;
-    ws.onerror = function () {};
-    ws.onopen = function () {
+    ws = s;
+    s.binaryType = 'arraybuffer';
+    s.onmessage = onMsg;
+    s.onerror = function () {};
+    s.opened = false;
+    s.onopen = function () {
+      if (ws !== s) { try { s.close(); } catch (e) {} return; }
+      s.opened = true;
       clearTimeout(connectTimer);
-      frames = 0; statT = Date.now(); pad = 0;
-      try { ws.send(new Uint8Array(2)); ws.send(soundOn ? 'A1' : 'A0'); } catch (e) {}
+      frames = 0; statT = Date.now(); pad = 0; lastMsgT = 0;
+      try { s.send(new Uint8Array(2)); s.send(soundOn ? 'A1' : 'A0'); } catch (e) {}
       if (soundOn) ensureAudio(gSr);
       attached++;
       if (attached === 1) autoStart();
       log('ws open');
     };
-    ws.onclose = function () { if (mode === 'game') retry('link closed'); };
+    s.onclose = function (e) {
+      if (ws !== s) return;
+      ws = null;
+      if (mode === 'game') {
+        /* one line per drop (max 10): a 1006 here means Gecko or the network
+         * tore the socket down, not the app */
+        if (s.opened && closeLogged < 10) { closeLogged++; log('ws drop ' + (e && e.code)); }
+        retry('link closed');
+      }
+    };
+    /* An attempt that never reaches OPEN must not freeze the ladder: Gecko
+     * reports some failures through onerror only (readyState 3, no onclose),
+     * and a CONNECTING socket can hang if the daemon is still booting. */
+    connectTimer = setTimeout(function () {
+      if (ws !== s || s.readyState === 1) return;
+      ws = null;
+      try { s.onclose = null; s.onmessage = null; s.onerror = null; s.close(); } catch (e) {}
+      retry('connect timeout');
+    }, 4000);
   }
 
   function retry(why) {
     if (mode !== 'game') return;
-    if (ws) { try { ws.onclose = null; ws.close(); } catch (e) {} }
-    ws = null;
     clearTimeout(connectTimer);
+    var s = ws;
+    ws = null;
+    if (s) { try { s.onclose = null; s.onmessage = null; s.onopen = null; s.close(); } catch (e) {} }
     if (tries > 0) {
       setStatus('connecting… ' + tries);
       connectTimer = setTimeout(function () { connect(tries - 1); }, 900);
@@ -279,7 +312,7 @@
 
   /* A main-thread stall is invisible in the old log: the app just stops reading
    * and the daemon times out after 6 s. Log the gap instead. */
-  var lastMsgT = 0, lagLogged = 0;
+  var lastMsgT = 0, lagLogged = 0, closeLogged = 0;
   function onMsg(ev) {
     var t = Date.now();
     if (lastMsgT && t - lastMsgT > 1200 && lagLogged < 5) {
