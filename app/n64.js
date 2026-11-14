@@ -19,18 +19,23 @@
  *
  * No CSS transforms, no C-side rotation: the picture is rotated inside the
  * RGB565->RGBA lookup loop (this Gecko misrenders transformed canvases).
+ * Orientation is a front-end choice only (right soft key -> Orientation):
+ * landscape = phone held sideways, the rotated 240x320 view; portrait = phone
+ * upright, the 320x240 frame scaled to 240x180 and letterboxed. Only the
+ * arrow cross follows the orientation.
  */
 (function () {
   'use strict';
   var API = 'http://127.0.0.1:8090';
   var EWS = 'ws://127.0.0.1:8081/';
-  var VER = '1.1.0';                 /* pack.sh rewrites to manifest version */
+  var VER = '1.2.0';                 /* pack.sh rewrites to manifest version */
 
   var menuEl, listEl, gameEl, gstat, cv, ctx;
   var mode = 'menu';
   var ws = null, connectTimer = 0, fails = 0;
   var rom = '', roms = [];
   var lut = null, img = null, u32 = null;
+  var colmap = null, rowmap = null, colW = 0, rowH = 0;
   var CW = 240, CH = 320;
   var pad = 0, frames = 0, statT = 0, curFps = 0, fw = 0, fh = 0;
   var rafPending = false, statHide = 0;
@@ -348,21 +353,43 @@
     var w = dv.getUint16(4), h = dv.getUint16(6);
     if (!w || !h || buf.byteLength < 8 + w * 2 * h) return;
     ensureLut();
-    /* portrait phone: rotate the landscape frame CW inside the LUT loop —
-     * source rows are read sequentially, the canvas stays native 240x320 and
-     * no CSS transform is involved. */
-    var dw = h, dh = w;
-    if (!img || cv.width !== dw || cv.height !== dh) {
+    /* landscape: rotate the frame CW inside the LUT loop — source rows are
+     * read sequentially, the canvas stays native 240x320 and no CSS transform
+     * is involved. portrait: no rotation, the 320x240 frame is nearest-neighbour
+     * scaled to the screen width (240x180) and centred, so the page background
+     * shows as black bars above and below. */
+    var port = (orient === 'port');
+    var dw = port ? CW : h;
+    var dh = port ? Math.round(h * CW / w) : w;
+    if (!img || cv.width !== dw || cv.height !== dh ||
+        colW !== w || rowH !== h) {
       cv.width = dw; cv.height = dh;
       ctx = cv.getContext('2d');
       img = ctx.createImageData(dw, dh);
       u32 = new Uint32Array(img.data.buffer);
+      colmap = new Int32Array(dw); rowmap = new Int32Array(dh);
+      for (var mx = 0; mx < dw; mx++) colmap[mx] = (mx * w / dw) | 0;
+      for (var my = 0; my < dh; my++) rowmap[my] = (my * h / dh) | 0;
+      colW = w; rowH = h;
+      cv.style.width = dw + 'px';
+      cv.style.height = dh + 'px';
+      cv.style.marginTop = Math.max(0, ((gameEl.clientHeight || CH) - dh) >> 1) + 'px';
+      log('frame ' + dw + 'x' + dh + ' ' + orient);
     }
     var src = new Uint16Array(buf, 8, w * h);
-    var ystep = w / dh;                    /* 1.0 for 320x240 sources */
-    for (var sy = 0; sy < h; sy++) {
-      var sb = sy * w, dx = h - 1 - sy;
-      for (var dy = 0; dy < dh; dy++) u32[dy * dw + dx] = lut[src[sb + ((dy * ystep) | 0)]];
+    var sy, dy, sb, o;
+    if (port) {
+      for (dy = 0; dy < dh; dy++) {
+        sb = rowmap[dy] * w; o = dy * dw;
+        for (var px = 0; px < dw; px++) u32[o + px] = lut[src[sb + colmap[px]]];
+      }
+    } else {
+      var ystep = w / dh;                  /* 1.0 for 320x240 sources */
+      for (sy = 0; sy < h; sy++) {
+        sb = sy * w;
+        var dx = h - 1 - sy;
+        for (dy = 0; dy < dh; dy++) u32[dy * dw + dx] = lut[src[sb + ((dy * ystep) | 0)]];
+      }
     }
     fw = w; fh = h; frames++;
     if (!rafPending && window.requestAnimationFrame) {
@@ -514,14 +541,15 @@
   var SLOTS = 5;
   var ovlEl, olistEl, ostatEl, otitleEl, ohintEl;
   var ovOpen = false, ovBusy = 0, ovTimer = 0, ovSlots = [];
-  var ovView = 'root';                /* 'root' | 'S' (save) | 'G' (load) */
+  var ovView = 'root';                /* 'root' | 'S' (save) | 'G' (load) | 'O' */
   var ovFocus = 0;                    /* focused row index inside the view */
 
-  var OV_TITLE = { root: 'SAVE / LOAD', S: 'SAVE STATE', G: 'LOAD STATE' };
+  var OV_TITLE = { root: 'MENU', S: 'SAVE STATE', G: 'LOAD STATE', O: 'ORIENTATION' };
   var OV_HINT = {
     root: 'OK select \u00b7 Back resume',
     S: 'OK save into slot \u00b7 Back menu',
-    G: 'OK load slot \u00b7 Back menu'
+    G: 'OK load slot \u00b7 Back menu',
+    O: 'OK set \u00b7 Back menu'
   };
 
   function ostatus(t) { if (ostatEl) ostatEl.textContent = t || ''; }
@@ -559,6 +587,17 @@
     if (ovView === 'root') {
       olistEl.appendChild(ovBtn('Load state', 0, function () { enterView('G'); }));
       olistEl.appendChild(ovBtn('Save state', 0, function () { enterView('S'); }));
+      olistEl.appendChild(ovBtn('Orientation', 0, function () { enterView('O'); }));
+    } else if (ovView === 'O') {
+      var modes = [['land', 'Landscape'], ['port', 'Portrait']];
+      for (i = 0; i < modes.length; i++) (function (v, label) {
+        olistEl.appendChild(ovBtn(label + (orient === v ? '   (on)' : ''), 0,
+          function () {
+            setOrient(v);
+            renderOvl();
+            ostatus('orientation: ' + label.toLowerCase());
+          }));
+      })(modes[i][0], modes[i][1]);
     } else {
       var kind = ovView;
       for (i = 1; i <= SLOTS; i++) (function (n, ts) {
@@ -575,7 +614,7 @@
     ovFocus = 0;
     ostatus('');
     renderOvl();
-    stList();                 /* fresh timestamps every time slots are shown */
+    if (v === 'S' || v === 'G') stList();   /* fresh timestamps when slots show */
   }
 
   function stList() {
@@ -691,22 +730,55 @@
   }
 
   /* --------------------------------------------------------------- input */
-  /* Portrait play: the phone is held rotated counter-clockwise (keypad on the
-   * right), so the arrow cross is remapped to match the rotated picture. The
-   * dialer keys 8/4/5/6 are orientation-free duplicates of the same four
-   * directions (fallback if a firmware reports different arrow key names). */
-  /* SoftRight is NOT a pad bit any more: it opens the save/load menu
-   * (openOvl). N64 R moved to SoftLeft (top-left button) so the phone keeps
-   * every N64 button. */
+  /* Landscape (default): the phone is held rotated counter-clockwise (keypad
+   * on the right), so the arrow cross is remapped to match the rotated
+   * picture. Portrait: the picture is upright, so arrows use the natural
+   * directions — exactly the four bits the dialer keys 8/4/5/6 send anyway.
+   * Numeric keys, OK, the soft keys, `*`, `#` and Back never depend on
+   * orientation. keyup() resolves bits through the same table, so a press can
+   * never stick; setOrient() also drops every held bit. */
+  /* SoftRight is NOT a pad bit any more: it opens the menu (openOvl). N64 R
+   * moved to SoftLeft (top-left button) so the phone keeps every N64 button. */
+  var orient = 'land';                /* 'land' | 'port' */
   var KEYBITS = {
-    ArrowUp: 6, ArrowLeft: 5, ArrowDown: 7, ArrowRight: 4,
-    Up: 6, Left: 5, Down: 7, Right: 4,
     '8': 4, '4': 6, '5': 5, '6': 7,
     Enter: 3, '1': 0, '2': 1, '3': 8,
     '7': 12, '9': 13,
     '*': 2, '#': 11,
     SoftLeft: 10
   };
+  var ARROWS_LAND = {
+    ArrowUp: 6, ArrowLeft: 5, ArrowDown: 7, ArrowRight: 4,
+    Up: 6, Left: 5, Down: 7, Right: 4
+  };
+  var ARROWS_PORT = {
+    ArrowUp: 4, ArrowLeft: 6, ArrowDown: 5, ArrowRight: 7,
+    Up: 4, Left: 6, Down: 5, Right: 7
+  };
+
+  function keyBit(k) {
+    var a = orient === 'port' ? ARROWS_PORT : ARROWS_LAND;
+    if (a[k] !== undefined) return a[k];
+    return KEYBITS[k];
+  }
+
+  function loadOrient() {
+    try {
+      var v = localStorage.getItem('n64.orient');
+      if (v === 'port' || v === 'land') orient = v;
+    } catch (e) {}
+  }
+
+  function setOrient(o) {
+    if (o !== 'port' && o !== 'land') return;
+    if (o === orient) return;
+    orient = o;
+    try { localStorage.setItem('n64.orient', o); } catch (e) {}
+    img = null;                 /* next frame rebuilds for the new shape */
+    if (pad) { pad = 0; sendPad(); }
+    log('orient ' + (o === 'port' ? 'portrait' : 'landscape'));
+  }
+
   var dbgK = 60, dbgP = 12;
   var autoT = [], attached = 0;
 
@@ -733,7 +805,7 @@
       if (k === 'Backspace' || k === 'BrowserBack' || k === 'Escape') { leaveGame(); return; }
       if (k === 'SoftRight') { if (!e.repeat) openOvl(); return; }
       if (k === '0') { if (!e.repeat) setSound(!soundOn); return; }
-      var bit = KEYBITS[k];
+      var bit = keyBit(k);
       if (dbgK > 0) {
         dbgK--;
         log('gk ' + k + '->' + bit + ' rep=' + (e.repeat ? 1 : 0) +
@@ -780,7 +852,7 @@
     if (mode !== 'game') return;
     e.preventDefault(); e.stopPropagation();
     if (ovOpen) return;                  /* overlay: pad already released */
-    var bit = KEYBITS[e.key];
+    var bit = keyBit(e.key);
     if (bit !== undefined && (pad & (1 << bit))) { pad &= ~(1 << bit); sendPad(); }
     showStatBriefly();
   }
@@ -856,6 +928,7 @@
     document.addEventListener('mozvisibilitychange', function () {
       if (document.mozHidden) releaseAll();
     });
+    loadOrient();            /* landscape unless the menu stored portrait */
     showMenu();
   });
 })();

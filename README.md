@@ -22,8 +22,10 @@ title screen, with sound, driven by the phone keypad. The emulator core
 
 There is no compositor on this phone, so a native process cannot draw to the
 screen: the GPU benefit is inside the daemon, and the finished frame travels to
-the app canvas. A 320×240 landscape frame is rotated to the phone's portrait
-screen inside the app's pixel loop (no CSS transforms).
+the app canvas. **Landscape** (the default) rotates the 320×240 frame to the
+phone's portrait screen inside the app's pixel loop and fills the display;
+**Portrait** (right soft key → Orientation) draws it unrotated, scaled to
+240×180 and centred between black bars. No CSS transforms either way.
 
 ---
 
@@ -60,23 +62,29 @@ Uninstall with `./uninstall.sh` (your ROMs and save files are left alone).
 
 ## Controls
 
-Hold the phone rotated **counter-clockwise** (keypad on the right, screen
-upright) — the picture is rotated for that grip and the arrow cross follows it.
+Default (**landscape**): hold the phone rotated **counter-clockwise** (keypad on
+the right, screen upright) — the picture is rotated for that grip and the arrow
+cross follows it. In **portrait** (menu → Orientation) the phone is held
+normally and the arrows become the plain directions.
 
 | key | N64 | action |
 |---|---|---|
-| arrows | Control Stick | move (full deflection = run) |
-| `8` `4` `5` `6` | Control Stick | same four directions (orientation-free fallback) |
+| arrows | Control Stick | move (full deflection = run) — landscape: the cross follows the rotated picture (`ArrowUp`=left on screen, `ArrowRight`=up); portrait: plain directions |
+| `8` `4` `5` `6` | Control Stick | same four screen directions in **both** orientations |
 | `2` | A | jump |
 | `1` | B | punch / attack |
 | `3` or `#` | Z | crouch / ground pound |
 | `7` / `9` | C-left / C-right | rotate camera |
 | `*` | L | camera recentre |
 | left soft key | R | (was the right soft key before v1.0.9) |
-| right soft key | | save/load menu (5 slots, see below) |
+| right soft key | | menu: Load state / Save state / Orientation |
 | OK | Start | |
 | `0` | | sound on/off (**starts muted**) |
 | Back | | stop the game, back to the ROM list |
+
+Only the arrow cross depends on the orientation; every other key sends the same
+pad bit in both modes (orientation is described in
+[Orientation](#orientation-v120)).
 
 Keys are read from `keydown`/`keyup` only, and a pad bit stays set until its key
 is released: this keypad does **not** auto-repeat arrow keys (`n64.log` shows a
@@ -103,15 +111,17 @@ message page before the stick responds.
 ### Save states (v1.0.9, two-page menu in v1.1.0)
 
 The **right soft key** (top-right, above the end-call key) opens an overlay
-while the game keeps running. Page one has exactly two entries:
+while the game keeps running. Page one has three entries (title `MENU` since
+v1.2.0, when Orientation joined them):
 
 ```
-SAVE / LOAD
+MENU
   Load state
   Save state
+  Orientation
 ```
 
-**OK** opens that page's five slots:
+**OK** opens the selected page. Load/Save show that page's five slots:
 
 ```
 LOAD STATE
@@ -137,6 +147,48 @@ usable slot, and loading drops the queued video/PCM backlog so the phone cannot
 paint pre-load frames over the restored scene. On this phone a save takes
 ~0.3 s and a load ~0.1 s (`n64play: state save|load slot N ok` in the emulator
 log).
+
+### Orientation (v1.2.0)
+
+Menu → **Orientation** offers **Landscape** (default) and **Portrait**; the
+active one is marked `(on)` and picking one applies immediately — the overlay
+stays up so you can flip between them, **Back** returns to the menu, then to the
+game.
+
+```
+ORIENTATION
+  Landscape   (on)
+  Portrait
+```
+
+* **Landscape** — unchanged behaviour: the 320×240 frame is rotated clockwise in
+  the RGB565→RGBA loop into a 240×320 canvas that fills the display. Hold the
+  phone rotated counter-clockwise.
+* **Portrait** — the frame is **not** rotated: it is nearest-neighbour scaled to
+  240×180 (0.75×) and centred vertically, so 70 px of black sit above and below
+  it. Hold the phone normally; the picture is upright.
+
+Only the arrow cross follows the orientation (`keyBit()` picks one of two
+tables, and `keyup` resolves through the same one, so a press can never stick;
+switching also drops every held bit):
+
+| key | landscape bit | portrait bit |
+|---|---|---|
+| `ArrowUp` | 6 (left on screen) | 4 (up) |
+| `ArrowDown` | 7 (right) | 5 (down) |
+| `ArrowLeft` | 5 (down) | 6 (left) |
+| `ArrowRight` | 4 (up) | 7 (right) |
+
+`8/4/5/6`, `2`, `1`, `3`, `#`, `7`, `9`, `*`, OK, both soft keys and Back send
+the same bit in both modes. The choice is stored in `localStorage`
+(`n64.orient`) and restored on the next launch; a fresh install starts in
+landscape. Log lines: `orient portrait|landscape`, `frame 240x180 port`,
+`frame 240x320 land`.
+
+The OS is not asked to rotate: this Gecko's `screen.orientation.lock()` needs
+fullscreen and the front end keeps the window upright on purpose, so both modes
+are plain canvas drawing (and the landscape path keeps its no-CSS-transform
+rule).
 
 ### Controls while the emulator starts
 
@@ -311,6 +363,8 @@ default mapping, so the frontend feeds that device from pad bits 12–15.
 | save/load menu says `emulator link down` | the WebSocket is down — the overlay still opens, but slots cannot be read or written; Back to resume, the app reconnects (see `retry` rows above) |
 | `save failed` / `load failed` | the daemon refused: `grep "state save\|state load" /data/local/tmp/n64play_gl.log` says why (open/write error, size mismatch after a core change, short read). A slot from an older core build is rejected on purpose — states are not portable across builds |
 | menu shows `empty` for a slot that was saved | the app and the daemon are talking about different ROM paths: slot files are named after the ROM file plus a hash of its full path, so moving/renaming the ROM starts a fresh set (`ls /data/local/n64/states`) |
+| picture has black bars above and below | the app is in **portrait** orientation (240×180 in a 240×320 window); menu → Orientation → Landscape for the full-screen rotated view |
+| arrows point the wrong way | arrow bits depend on the orientation (see [Orientation](#orientation-v120)): `gk ArrowUp->6` is landscape, `->4` is portrait; switching orientation releases every held bit |
 | screen dims after ~15 s | wake lock not held: check `grep wakelock /data/local/tmp/n64.log`; re-run `./install.sh` (grants `wakeLock`/`power`) and restart the app |
 | sound crackles / drops | daemon log shows `adrop=` growing: the phone is behind the stream, so old PCM is discarded on purpose (the game keeps running); `vdrop=` growing means whole frames are being skipped for the same reason |
 
