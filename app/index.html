@@ -3,7 +3,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
 <meta name="theme-color" content="#000000">
 <title>N64</title>
-<link rel="stylesheet" href="style.css?v=1.0.8">
+<link rel="stylesheet" href="style.css?v=1.1.0">
 </head><body>
 
 <!-- No editable element on purpose. While a text field holds focus the KaiOS
@@ -23,5 +23,15 @@
   <div id="gstat">&#8230;</div>
 </div>
 
-<script src="n64.js?v=1.0.8"></script>
+<!-- In-game save/load menu (SoftRight over the running game): page 1 = the
+     two sections, page 2 = that section's five slots (n64.js draws both).
+     Like the ROM list this is buttons only: no editable element. -->
+<div id="ovl">
+  <div id="otitle">SAVE / LOAD</div>
+  <div id="ohint">OK select &#183; Back resume</div>
+  <div id="olist"></div>
+  <div id="ostat"></div>
+</div>
+
+<script src="n64.js?v=1.1.0"></script>
 </body></html>

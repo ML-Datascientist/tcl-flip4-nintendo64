@@ -27,7 +27,7 @@ html, body {
   white-space: nowrap; overflow: hidden;
 }
 #mlist { flex: 1; overflow-y: auto; }
-#mlist button {
+#mlist button, #olist button {
   display: block; width: 100%;
   text-align: left;
   background: #0b1118; color: #e8eef2;
@@ -36,7 +36,7 @@ html, body {
   padding: 9px 8px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-#mlist button:focus {
+#mlist button:focus, #olist button:focus {
   background: #ffd23f; color: #101010;
   outline: none;
 }
@@ -44,6 +44,43 @@ html, body {
   padding: 10px 8px; color: #7f97a8; font: 12px/1.35 monospace; white-space: pre-wrap;
 }
 #mlist .err { color: #ff7b6b; }
+
+/* ------------------------------------------------- save/load overlay */
+#ovl {
+  display: none;
+  position: fixed; inset: 0; z-index: 3;
+  flex-direction: column;
+  background: #05070a;
+}
+#ovl.on { display: flex; }
+#otitle {
+  padding: 6px 8px 4px;
+  font: 700 15px/1.1 monospace;
+  letter-spacing: 1px;
+  color: #ffd23f;
+  border-bottom: 1px solid #203040;
+}
+#ohint {
+  padding: 3px 8px 5px;
+  font: 11px monospace; color: #6d8fa4;
+  border-bottom: 1px solid #16202a;
+  white-space: nowrap; overflow: hidden;
+}
+#olist { flex: 1; overflow-y: auto; }
+#olist button {
+  padding: 6px 8px;
+  font: 12px/1.2 monospace;
+  border-bottom: 1px solid #101820;
+}
+#olist button.off { color: #5d7788; }
+#ostat {
+  min-height: 14px;
+  padding: 4px 8px;
+  font: 11px monospace; color: #cfdae2;
+  background: #0b1118;
+  border-top: 1px solid #16202a;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 
 /* ------------------------------------------------------------------ game */
 #game { display: none; position: fixed; inset: 0; background: #000; }

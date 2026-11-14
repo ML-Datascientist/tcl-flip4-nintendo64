@@ -69,6 +69,8 @@ upright) — the picture is rotated for that grip and the arrow cross follows it
 | `3` or `#` | Z | crouch / ground pound |
 | `7` / `9` | C-left / C-right | rotate camera |
 | `*` | L | camera recentre |
+| left soft key | R | (was the right soft key before v1.0.9) |
+| right soft key | | save/load menu (5 slots, see below) |
 | OK | Start | |
 | `0` | | sound on/off (**starts muted**) |
 | Back | | stop the game, back to the ROM list |
@@ -94,6 +96,44 @@ Menu: arrows to move, **OK** to play, **`*`** to rescan the ROM folder,
 
 SM64 note: the intro dialogue swallows input — press **A** (`2`) to clear each
 message page before the stick responds.
+
+### Save states (v1.0.9, two-page menu in v1.1.0)
+
+The **right soft key** (top-right, above the end-call key) opens an overlay
+while the game keeps running. Page one has exactly two entries:
+
+```
+SAVE / LOAD
+  Load state
+  Save state
+```
+
+**OK** opens that page's five slots:
+
+```
+LOAD STATE
+  Slot 1   11-11 21:44
+  Slot 2   empty
+  …
+```
+
+**OK** on a SAVE row writes that slot immediately (overwrites whatever was
+there), **OK** on a LOAD row restores it and closes the menu; empty LOAD rows
+are grey and do nothing. Arrows move, **Back** goes slots → first page → game
+without touching the game. A slot's label is the file's timestamp, so it
+survives app restarts, reboots and even a wiped ROM directory — the menu reads
+the same five files the emulator writes.
+
+N64 **R** moved to the **left** soft key to free the right one; nothing else in
+the pad map changed.
+
+States live in `/data/local/n64/states/<rom name>.<hash>.<1-5>.st`, ~16.8 MB
+each (the core's full savestate blob plus a 16-byte header). The daemon writes
+via a `.part` file + `rename`, so a save killed mid-write never shows up as a
+usable slot, and loading drops the queued video/PCM backlog so the phone cannot
+paint pre-load frames over the restored scene. On this phone a save takes
+~0.3 s and a load ~0.1 s (`n64play: state save|load slot N ok` in the emulator
+log).
 
 ### Controls while the emulator starts
 
@@ -141,6 +181,7 @@ foreground. Confirm with `grep wakelock /data/local/tmp/n64.log` →
 |---|---|
 | `/data/media/roms` | ROMs (`*.z64`, `*.n64`, `*.v64`) and their `.srm` saves |
 | `/data/local/n64` | `n64play_gl`, `n64svc`, `n64boot`, `Mupen64plus/mupen64plus.ini` |
+| `/data/local/n64/states` | save-state slots for the right-soft-key menu (`*.st`) |
 | `/data/local/webapps/installed/n64` | app package (`application.zip`) |
 | `/data/local/tmp/n64play_gl.log` | emulator log (fps, pad bits, errors) |
 | `/data/local/tmp/n64.log` | app log (`boot v…`, key trace, audio state) |
@@ -264,6 +305,9 @@ default mapping, so the frontend feeds that device from pad bits 12–15.
 | arrows move Mario only a step | every bit is held until `keyup`, so a hold walks; if the log shows one `gk ArrowUp->6` per press but Mario stops early, a stuck keyup came from an overlay — tap Back and reopen |
 | low fps | check the daemon log; fps is limited by the N64 (60 Hz); if `run=` is large, another app is competing for CPU |
 | no sound | it starts muted — press `0` (the daemon logs `n64play: audio on` and the app logs `sound on`); `no AudioContext` in `n64.log` means Gecko refused the context, so tap `0` again after a key press |
+| save/load menu says `emulator link down` | the WebSocket is down — the overlay still opens, but slots cannot be read or written; Back to resume, the app reconnects (see `retry` rows above) |
+| `save failed` / `load failed` | the daemon refused: `grep "state save\|state load" /data/local/tmp/n64play_gl.log` says why (open/write error, size mismatch after a core change, short read). A slot from an older core build is rejected on purpose — states are not portable across builds |
+| menu shows `empty` for a slot that was saved | the app and the daemon are talking about different ROM paths: slot files are named after the ROM file plus a hash of its full path, so moving/renaming the ROM starts a fresh set (`ls /data/local/n64/states`) |
 | screen dims after ~15 s | wake lock not held: check `grep wakelock /data/local/tmp/n64.log`; re-run `./install.sh` (grants `wakeLock`/`power`) and restart the app |
 | sound crackles / drops | daemon log shows `adrop=` growing: the phone is behind the stream, so old PCM is discarded on purpose (the game keeps running); `vdrop=` growing means whole frames are being skipped for the same reason |
 

@@ -18,13 +18,20 @@
  *                bit2  key '*'   -> Select     bit3  OK       -> Start
  *                bit4..7 arrows  -> dpad AND analog stick (full deflection =
  *                                   run, matching N64-original dpad behaviour)
- *                bit8  key '3'   -> Z (alt)    bit9  SoftLeft -> (unused)
- *                bit10 SoftRight -> R          bit11 key '#'  -> Z
+ *                bit8  key '3'   -> Z (alt)    bit9  SoftLeft -> R
+ *                bit10 (spare; was R — the app now uses SoftRight for its
+ *                       save/load menu and R moved to SoftLeft)
+ *                bit11 key '#'  -> Z
  *                bit12 key '7'   -> C left     bit13 key '9'  -> C right
  *                bit14 (spare)   -> C up       bit15 (spare)  -> C down
  *              (bits 12-15 feed RETRO_DEVICE_INDEX_ANALOG_RIGHT; the C
  *              buttons have no joypad ids in this core's default mapping)
  *   cmd:       TEXT "R" reset; "A0"/"A1" audio off/on
+ *              TEXT "L"  list slots  -> reply TEXT "SL <mtime1>..<mtime5>"
+ *              TEXT "S<n>"/"G<n>" save/load slot n -> reply "SV|LD <n> ok|err"
+ *
+ * Save states: 5 slots in /data/local/n64/states (N64PLAY_STATES overrides),
+ * <rom base>.<fnv32 of path>.<n>.st, ~16.8 MB each; mtime is the label.
  *
  * Saves: mempak (SM64!) is written through to <romdir>/<Game Name>.mp1 by the
  * core on every mempak write — kill-safe. Cart saves additionally flushed to
@@ -45,6 +52,7 @@
 #include <time.h>
 #include <signal.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -648,6 +656,200 @@ static int ws_send_frame(int c)
    return out_flush(c);
 }
 
+/* ------------------------------------------------------------ save states */
+/* Five fixed slots, one file each. The directory is NOT the ROM directory:
+ * saves must survive somebody wiping /data/media/roms.
+ *   /data/local/n64/states/<rom base>.<fnv32 of path>.<slot>.st
+ * A slot's timestamp is the file mtime, so there is no index file that can go
+ * stale, and a deleted file reads back as "empty".
+ * File layout: "N64ST1\0\0" + payload size (LE32) + 4 reserved + payload.
+ * Payload is the m64p savestate blob straight out of retro_serialize().
+ * Only the emulator thread (session loop) touches g_st_buf. */
+#define ST_SLOTS 5
+static char g_state_dir[480] = "/data/local/n64/states";
+static char g_state_base[128];
+static uint8_t *g_st_buf;
+static size_t g_st_size;               /* retro_serialize_size() */
+static int g_st_job;                   /* 0 none, 1 save, 2 load */
+static int g_st_slot;
+
+/* Small text replies cannot be spliced into a half-written video/audio
+ * message: they are queued and sent only when the wire is idle. */
+#define TXQ 8
+#define TXLEN 96                       /* "SL" + five 10-digit mtimes = 58 */
+static char g_tx[TXQ][TXLEN];
+static int g_tx_n;
+
+static int state_path(int slot, char *out, size_t n)
+{
+   int r = snprintf(out, n, "%s/%s.%d.st", g_state_dir, g_state_base, slot);
+   return r > 0 && (size_t)r < n;
+}
+
+static void state_queue_tx(const char *s)
+{
+   if (g_tx_n >= TXQ) { g_tx_n--; }     /* keep the newest */
+   if (g_tx_n < 0) g_tx_n = 0;
+   snprintf(g_tx[g_tx_n], sizeof(g_tx[0]), "%s", s);
+   g_tx_n++;
+}
+
+static void state_queue_list(void)
+{
+   char s[ST_SLOTS * 16 + 8];
+   int i, off = 0;
+   struct stat st;
+   off += snprintf(s + off, sizeof(s) - (size_t)off, "SL");
+   for (i = 1; i <= ST_SLOTS; i++) {
+      char p[600];
+      long mt = 0;
+      if (state_path(i, p, sizeof p) && stat(p, &st) == 0) mt = (long)st.st_mtime;
+      off += snprintf(s + off, sizeof(s) - (size_t)off, " %ld", mt);
+   }
+   state_queue_tx(s);
+}
+
+/* The app's own render loop takes the newest frame it gets, so dropping the
+ * daemon's pending frame is enough to stop pre-load frames from painting over
+ * the loaded scene. Only a frame that has NOT started going out may be
+ * dropped: cutting a half-written WebSocket message desynchronises the app's
+ * parser (it would read the rest of that payload as a new message). The PCM
+ * ring is left alone for the same reason — it is at most 512 KiB and drains
+ * by itself. */
+static void state_drop_queues(void)
+{
+   if (g_vq_off == 0) g_vq_len = 0;
+   g_frame_ready = 0;
+}
+
+static int st_alloc(void)
+{
+   if (g_st_buf) return 1;
+   g_st_buf = (uint8_t *)malloc(g_st_size);
+   return g_st_buf != NULL;
+}
+
+static int st_save(int slot)
+{
+   char path[600], tmp[620];
+   uint8_t hdr[16];
+   int fd, i;
+   int64_t t0 = now_us();
+   size_t done = 0;
+   if (!state_path(slot, path, sizeof path) || !g_st_size) return 0;
+   if (!st_alloc()) { LOG("n64play: state save: out of memory"); return 0; }
+   if (!retro_serialize(g_st_buf, g_st_size)) {
+      LOG("n64play: state save slot %d: serialize refused", slot);
+      return 0;
+   }
+   memcpy(hdr, "N64ST1\0\0", 8);
+   hdr[8] = (uint8_t)g_st_size; hdr[9] = (uint8_t)(g_st_size >> 8);
+   hdr[10] = (uint8_t)(g_st_size >> 16); hdr[11] = (uint8_t)(g_st_size >> 24);
+   hdr[12] = hdr[13] = hdr[14] = hdr[15] = 0;
+   /* write aside + rename: a killed save must not leave a half state that
+    * later reads as "present but broken" */
+   snprintf(tmp, sizeof tmp, "%s.part", path);
+   fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+   if (fd < 0) { LOG("n64play: state save slot %d: open %s: %s", slot, tmp, strerror(errno)); return 0; }
+   for (i = 0; i < 16; ) {
+      ssize_t w = write(fd, hdr + i, 16 - (size_t)i);
+      if (w <= 0) break;
+      i += (int)w;
+   }
+   if (i != 16) {
+      LOG("n64play: state save slot %d: header write: %s", slot, strerror(errno));
+      close(fd); unlink(tmp);
+      return 0;
+   }
+   done = 0;
+   while (done < g_st_size) {
+      ssize_t w = write(fd, g_st_buf + done, g_st_size - done);
+      if (w <= 0) break;
+      done += (size_t)w;
+   }
+   if (done != g_st_size || fsync(fd)) {
+      LOG("n64play: state save slot %d: write %zu/%zu: %s", slot, done, g_st_size, strerror(errno));
+      close(fd); unlink(tmp);
+      return 0;
+   }
+   close(fd);
+   if (rename(tmp, path)) {
+      LOG("n64play: state save slot %d: rename: %s", slot, strerror(errno));
+      unlink(tmp);
+      return 0;
+   }
+   LOG("n64play: state save slot %d ok -> %s (%zu B, %.0f ms)",
+       slot, path, g_st_size, (now_us() - t0) / 1000.0);
+   return 1;
+}
+
+static int st_load(int slot)
+{
+   char path[600];
+   uint8_t hdr[16];
+   uint32_t sz;
+   int fd;
+   size_t done = 0;
+   int64_t t0 = now_us();
+   if (!state_path(slot, path, sizeof path) || !g_st_size) return 0;
+   fd = open(path, O_RDONLY);
+   if (fd < 0) { LOG("n64play: state load slot %d: no file %s", slot, path); return 0; }
+   if (read(fd, hdr, 16) != 16 || memcmp(hdr, "N64ST1\0\0", 8)) {
+      LOG("n64play: state load slot %d: bad header", slot);
+      close(fd); return 0;
+   }
+   sz = (uint32_t)hdr[8] | ((uint32_t)hdr[9] << 8) | ((uint32_t)hdr[10] << 16) | ((uint32_t)hdr[11] << 24);
+   if (sz != g_st_size) {
+      LOG("n64play: state load slot %d: size %u != %zu (core changed?)", slot, sz, g_st_size);
+      close(fd); return 0;
+   }
+   if (!st_alloc()) { close(fd); return 0; }
+   while (done < g_st_size) {
+      ssize_t r = read(fd, g_st_buf + done, g_st_size - done);
+      if (r <= 0) break;
+      done += (size_t)r;
+   }
+   close(fd);
+   if (done != g_st_size) {
+      LOG("n64play: state load slot %d: short read %zu/%zu", slot, done, g_st_size);
+      return 0;
+   }
+   if (!retro_unserialize(g_st_buf, g_st_size)) {
+      LOG("n64play: state load slot %d: unserialize refused", slot);
+      return 0;
+   }
+   state_drop_queues();
+   LOG("n64play: state load slot %d ok <- %s (%.0f ms)", slot, path, (now_us() - t0) / 1000.0);
+   return 1;
+}
+
+static void state_init_paths(const char *rom)
+{
+   const char *sd = getenv("N64PLAY_STATES");
+   const char *base, *dot, *p;
+   size_t n, i;
+   uint32_t h = 2166136261u;
+   if (sd && *sd) snprintf(g_state_dir, sizeof g_state_dir, "%s", sd);
+   base = strrchr(rom, '/');
+   base = base ? base + 1 : rom;
+   dot = strrchr(base, '.');
+   n = dot ? (size_t)(dot - base) : strlen(base);
+   for (i = 0; i < n && i + 12 < sizeof(g_state_base); i++) {
+      char c = base[i];
+      g_state_base[i] = ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                         (c >= '0' && c <= '9') || c == '-') ? c : '_';
+   }
+   g_state_base[i] = 0;
+   if (!i) snprintf(g_state_base, sizeof g_state_base, "rom");
+   for (p = rom; *p; p++) { h ^= (uint8_t)*p; h *= 16777619u; }
+   n = strlen(g_state_base);
+   snprintf(g_state_base + n, sizeof(g_state_base) - n, ".%08x", (unsigned)h);
+   if (mkdir(g_state_dir, 0755) && errno != EEXIST)
+      LOG("n64play: state dir %s: %s", g_state_dir, strerror(errno));
+   g_st_size = retro_serialize_size();
+   LOG("n64play: states -> %s/%s.N.st (%zu B x %d)", g_state_dir, g_state_base, g_st_size, ST_SLOTS);
+}
+
 static uint8_t g_acc[4096];
 static int     g_acclen;
 
@@ -692,6 +894,17 @@ static int drain_input(int c)
          g_audio_on = tmp[1] == '1';
          LOG("n64play: audio %s", g_audio_on ? "on" : "off");
       }
+      else if (op == 0x1 && len == 1 && tmp[0] == 'L') {
+         state_queue_list();
+      }
+      else if (op == 0x1 && len == 2 && (tmp[0] == 'S' || tmp[0] == 'G') &&
+               tmp[1] >= '1' && tmp[1] < '1' + ST_SLOTS) {
+         /* queued: serialize/unserialize must run on the emulator thread
+          * between two retro_run() calls, never inside drain_input() */
+         g_st_job = tmp[0] == 'S' ? 1 : 2;
+         g_st_slot = tmp[1] - '0';
+         LOG("n64play: state %s slot %d requested", g_st_job == 1 ? "save" : "load", g_st_slot);
+      }
       g_acclen -= (int)(hl + len);
       if (g_acclen) memmove(g_acc, g_acc + hl + len, g_acclen);
    }
@@ -724,6 +937,8 @@ static int session(int c)
    g_audio_on = 1;                 /* the app sends A0/A1 right after open */
    g_vq_len = g_vq_off = 0;
    g_aq_head = g_aq_tail = 0;
+   g_tx_n = 0;
+   g_st_job = 0;
    t0 = fps_t = now_us();
    {
       int64_t period = (int64_t)(1000000.0 / g_av_fps + 0.5);
@@ -736,6 +951,14 @@ static int session(int c)
             acc_run += now_us() - r0;
          }
          PROBE("B-run");
+         if (g_st_job) {
+            int j = g_st_job, sl = g_st_slot, ok;
+            char rep[40];
+            g_st_job = 0;
+            ok = j == 1 ? st_save(sl) : st_load(sl);
+            snprintf(rep, sizeof(rep), "%s %d %s", j == 1 ? "SV" : "LD", sl, ok ? "ok" : "err");
+            state_queue_tx(rep);
+         }
          if (g_frame_ready) {
             int64_t s0;
             g_frame_ready = 0;
@@ -745,6 +968,14 @@ static int session(int c)
             frames++;
          }
          if (out_flush(c) < 0) { LOG("n64play: send failed at it=%ld", (long)it); g_wsc = -1; return -1; }
+         /* a text reply may only go out when no binary message is half
+          * written (a frame or PCM batch in flight), else the app's
+          * WebSocket parser reads garbage */
+         if (g_tx_n > 0 && !g_vq_len && g_aq_head == g_aq_tail) {
+            if (ws_send_text(c, g_tx[0]) < 0) { LOG("n64play: text send failed at it=%ld", (long)it); g_wsc = -1; return -1; }
+            memmove(g_tx[0], g_tx[1], (size_t)(g_tx_n - 1) * sizeof(g_tx[0]));
+            g_tx_n--;
+         }
          acc_n++;
          it++;
          if (it <= 3 || it % 30 == 0) {
@@ -883,6 +1114,9 @@ int main(int argc, char **argv)
       g_sr = (unsigned)av.timing.sample_rate;
       LOG("n64play: av %ux%u fps=%.3f audio=%u rom=%ldB", g_av_w, g_av_h, g_av_fps, g_sr, sz);
    }
+
+   /* slot files for the save/load menu (needs the core loaded: state size) */
+   state_init_paths(rom);
 
    /* restore cart-save blob if present (mempak lives in <romdir>/<Game>.mp1,
     * written by the core itself — nothing to do there) */

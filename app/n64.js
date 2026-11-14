@@ -11,8 +11,11 @@
  *   video  BINARY 'M','D','1',0, w16, h16 + RGB565 LE rows
  *   audio  BINARY 'M','D','A',0 + stereo int16 LE
  *   input  BINARY 2-byte LE bitmask (bit0 '1'=B, bit1 '2'=A, bit4..7 stick,
- *           bit8 '3'=Z, bit10 R, bit11 '#'=Z, bit12 '7'=C-left, bit13 '9'=C-right)
+ *           bit8 '3'=Z, bit10 R (SoftLeft), bit11 '#'=Z, bit12 '7'=C-left,
+ *           bit13 '9'=C-right; SoftRight is the save/load menu, not a pad bit)
  *   cmd    TEXT "A1"/"A0" audio on/off
+ *          TEXT "L" list state slots   -> TEXT "SL <mtime1>..<mtime5>" (0=empty)
+ *          TEXT "S<n>"/"G<n>" save/load -> TEXT "SV|LD <n> ok|err"
  *
  * No CSS transforms, no C-side rotation: the picture is rotated inside the
  * RGB565->RGBA lookup loop (this Gecko misrenders transformed canvases).
@@ -21,7 +24,7 @@
   'use strict';
   var API = 'http://127.0.0.1:8090';
   var EWS = 'ws://127.0.0.1:8081/';
-  var VER = '1.0.8';                 /* pack.sh rewrites to manifest version */
+  var VER = '1.1.0';                 /* pack.sh rewrites to manifest version */
 
   var menuEl, listEl, gameEl, gstat, cv, ctx;
   var mode = 'menu';
@@ -94,6 +97,7 @@
   }
 
   function startRom(name) {
+    closeOvl();
     rom = name;
     fails = 0;
     attached = 0;
@@ -183,6 +187,7 @@
   }
 
   function leaveGame() {
+    closeOvl();
     mode = 'menu';
     clearTimeout(connectTimer);
     autoCancel();
@@ -326,6 +331,8 @@
   function onMsg1(ev) {
     if (typeof ev.data === 'string') {
       var p = ev.data.split(' ');                 /* MD1 w h fps sr */
+      if (p[0] === 'SL') { onSlots(p); return; }  /* slot list (save/load menu) */
+      if (p[0] === 'SV' || p[0] === 'LD') { onStateAck(p); return; }
       if (p.length >= 5) {
         gSr = parseInt(p[4], 10) || 44100;
         setStatus(shortName() + ' ' + parseFloat(p[3]).toFixed(0) + 'fps', true);
@@ -499,11 +506,198 @@
     actx = null; aproc = null; aGain = null; aq = null; armed = false; ffrac = 0;
   }
 
+  /* ------------------------------------------------------- save/load menu */
+  /* SoftRight opens this overlay over the running game: first page = the two
+   * sections, second page = that section's five slots. Rows are plain buttons
+   * (the app never creates an editable element). The daemon owns the slots:
+   * "L" lists them, "S<n>"/"G<n>" save/load, replies arrive as TEXT. */
+  var SLOTS = 5;
+  var ovlEl, olistEl, ostatEl, otitleEl, ohintEl;
+  var ovOpen = false, ovBusy = 0, ovTimer = 0, ovSlots = [];
+  var ovView = 'root';                /* 'root' | 'S' (save) | 'G' (load) */
+  var ovFocus = 0;                    /* focused row index inside the view */
+
+  var OV_TITLE = { root: 'SAVE / LOAD', S: 'SAVE STATE', G: 'LOAD STATE' };
+  var OV_HINT = {
+    root: 'OK select \u00b7 Back resume',
+    S: 'OK save into slot \u00b7 Back menu',
+    G: 'OK load slot \u00b7 Back menu'
+  };
+
+  function ostatus(t) { if (ostatEl) ostatEl.textContent = t || ''; }
+
+  function fmtSlot(t) {
+    if (!t) return 'empty';
+    var d = new Date(t * 1000);
+    function z(n) { return n < 10 ? '0' + n : '' + n; }
+    return z(d.getMonth() + 1) + '-' + z(d.getDate()) + ' ' +
+           z(d.getHours()) + ':' + z(d.getMinutes());
+  }
+
+  function ovBtn(label, off, fn) {
+    var b = document.createElement('button');
+    b.textContent = label;
+    if (off) b.className = 'off';
+    b.addEventListener('click', fn);
+    return b;
+  }
+
+  function focusRow(i) {
+    var btns = olistEl.querySelectorAll('button');
+    if (!btns.length) return;
+    if (i < 0 || i >= btns.length) i = 0;
+    ovFocus = i;
+    try { btns[i].focus(); } catch (e) {}
+  }
+
+  function renderOvl() {
+    if (!olistEl) return;
+    var i;
+    olistEl.textContent = '';
+    otitleEl.textContent = OV_TITLE[ovView];
+    ohintEl.textContent = OV_HINT[ovView];
+    if (ovView === 'root') {
+      olistEl.appendChild(ovBtn('Load state', 0, function () { enterView('G'); }));
+      olistEl.appendChild(ovBtn('Save state', 0, function () { enterView('S'); }));
+    } else {
+      var kind = ovView;
+      for (i = 1; i <= SLOTS; i++) (function (n, ts) {
+        olistEl.appendChild(ovBtn('Slot ' + n + '   ' + fmtSlot(ts),
+                                  kind === 'G' && !ts,
+                                  function () { doSlot(kind, n); }));
+      })(i, ovSlots[i - 1] || 0);
+    }
+    setTimeout(function () { focusRow(ovFocus); }, 20);
+  }
+
+  function enterView(v) {
+    ovView = v;
+    ovFocus = 0;
+    ostatus('');
+    renderOvl();
+    stList();                 /* fresh timestamps every time slots are shown */
+  }
+
+  function stList() {
+    if (ws && ws.readyState === 1) {
+      try { ws.send('L'); } catch (e) { log('state list fail ' + e); }
+      ostatus('reading slots…');
+    } else {
+      ostatus('emulator link down — Back to resume');
+    }
+  }
+
+  function doSlot(kind, i) {
+    if (!ws || ws.readyState !== 1) { ostatus('emulator link down'); return; }
+    if (kind === 'G' && !(ovSlots[i - 1] || 0)) { ostatus('Slot ' + i + ' is empty'); return; }
+    ovBusy = 1;
+    ostatus((kind === 'S' ? 'saving slot ' : 'loading slot ') + i + '…');
+    try { ws.send(kind + i); }
+    catch (e) { ovBusy = 0; log('state send fail ' + e); ostatus('send failed'); return; }
+    clearTimeout(ovTimer);
+    ovTimer = setTimeout(function () {
+      if (!ovBusy) return;
+      ovBusy = 0;
+      ostatus('no reply from the emulator');
+    }, 6000);
+  }
+
+  /* TEXT replies from the daemon: "SL m1 m2 m3 m4 m5", "SV|LD <n> ok|err" */
+  function onSlots(p) {
+    ovSlots = [];
+    for (var i = 1; i <= SLOTS; i++) ovSlots.push(parseInt(p[i], 10) || 0);
+    log('states ' + ovSlots.join(','));
+    if (ovOpen) {
+      renderOvl();
+      if (!ovBusy && ostatEl && ostatEl.textContent === 'reading slots…') ostatus('');
+    }
+  }
+
+  function onStateAck(p) {
+    var kind = p[0], n = parseInt(p[1], 10) || 0, ok = p[2] === 'ok';
+    ovBusy = 0;
+    clearTimeout(ovTimer);
+    log('state ' + kind + ' ' + n + ' ' + (ok ? 'ok' : 'err'));
+    if (kind === 'SV') {
+      /* refresh first: stList() overwrites the status line, so the result
+       * message has to be written after it */
+      if (ok) { stList(); ostatus('saved slot ' + n); }
+      else ostatus('save failed (slot ' + n + ')');
+      return;
+    }
+    if (ok) {
+      closeOvl();
+      setStatus(shortName() + ' loaded slot ' + n, true);
+    } else {
+      ostatus('load failed (slot ' + n + ')');
+    }
+  }
+
+  function openOvl() {
+    if (mode !== 'game' || ovOpen) return;
+    ovOpen = true;
+    /* nothing of the player's is held while the overlay is up */
+    if (pad) { pad = 0; sendPad(); }
+    ovView = 'root';
+    ovFocus = 0;
+    ovSlots = [];
+    document.body.className = 'playing overlaying';
+    ovlEl.className = 'on';
+    renderOvl();
+    ostatus((ws && ws.readyState === 1) ? '' : 'emulator link down — Back to resume');
+    log('menu open');
+  }
+
+  function closeOvl() {
+    if (!ovOpen) return;
+    ovOpen = false;
+    ovBusy = 0;
+    clearTimeout(ovTimer);
+    if (ovlEl) ovlEl.className = '';
+    if (mode === 'game') document.body.className = 'playing';
+    log('menu close');
+  }
+
+  /* Back: slots -> first page -> game. */
+  function ovBack() {
+    if (ovView !== 'root') {
+      ovView = 'root';
+      ovFocus = 0;
+      ostatus('');
+      renderOvl();
+      return;
+    }
+    closeOvl();
+  }
+
+  function ovKey(k, e) {
+    if (e.type !== 'keydown') return;
+    if (k === 'Backspace' || k === 'BrowserBack' || k === 'Escape' || k === 'SoftRight') {
+      ovBack();
+      return;
+    }
+    if (k === 'Enter' && e.repeat) return;
+    var btns = olistEl.querySelectorAll('button');
+    if (!btns.length) return;
+    var idx = -1, i;
+    for (i = 0; i < btns.length; i++) if (btns[i] === document.activeElement) idx = i;
+    if (k === 'ArrowDown' || k === 'Down' || k === 'ArrowRight' || k === 'Right' || k === '6' || k === '8') {
+      focusRow(idx < 0 ? 0 : (idx + 1) % btns.length);
+    } else if (k === 'ArrowUp' || k === 'Up' || k === 'ArrowLeft' || k === 'Left' || k === '4' || k === '5') {
+      focusRow(idx < 0 ? btns.length - 1 : (idx - 1 + btns.length) % btns.length);
+    } else if (k === 'Enter') {
+      if (idx >= 0) btns[idx].click();
+    }
+  }
+
   /* --------------------------------------------------------------- input */
   /* Portrait play: the phone is held rotated counter-clockwise (keypad on the
    * right), so the arrow cross is remapped to match the rotated picture. The
    * dialer keys 8/4/5/6 are orientation-free duplicates of the same four
    * directions (fallback if a firmware reports different arrow key names). */
+  /* SoftRight is NOT a pad bit any more: it opens the save/load menu
+   * (openOvl). N64 R moved to SoftLeft (top-left button) so the phone keeps
+   * every N64 button. */
   var KEYBITS = {
     ArrowUp: 6, ArrowLeft: 5, ArrowDown: 7, ArrowRight: 4,
     Up: 6, Left: 5, Down: 7, Right: 4,
@@ -511,7 +705,7 @@
     Enter: 3, '1': 0, '2': 1, '3': 8,
     '7': 12, '9': 13,
     '*': 2, '#': 11,
-    SoftLeft: 9, SoftRight: 10
+    SoftLeft: 10
   };
   var dbgK = 60, dbgP = 12;
   var autoT = [], attached = 0;
@@ -535,7 +729,9 @@
     var k = e.key;
     if (mode === 'game') {
       e.preventDefault(); e.stopPropagation();
+      if (ovOpen) { ovKey(k, e); return; }
       if (k === 'Backspace' || k === 'BrowserBack' || k === 'Escape') { leaveGame(); return; }
+      if (k === 'SoftRight') { if (!e.repeat) openOvl(); return; }
       if (k === '0') { if (!e.repeat) setSound(!soundOn); return; }
       var bit = KEYBITS[k];
       if (dbgK > 0) {
@@ -583,6 +779,7 @@
   function keyup(e) {
     if (mode !== 'game') return;
     e.preventDefault(); e.stopPropagation();
+    if (ovOpen) return;                  /* overlay: pad already released */
     var bit = KEYBITS[e.key];
     if (bit !== undefined && (pad & (1 << bit))) { pad &= ~(1 << bit); sendPad(); }
     showStatBriefly();
@@ -600,7 +797,7 @@
    * first minute. Sequence proven headless on this phone: START @16/21 s,
    * A @29/39/49 s from the first attach (see mario_gpu.md §6). */
   function pressBit(bit, hold) {
-    if (mode !== 'game' || bit === undefined) return;
+    if (mode !== 'game' || bit === undefined || ovOpen) return;
     var t = hold || 350;
     clearTimeout(holdT[bit]);
     holdT[bit] = setTimeout(function () {
@@ -644,6 +841,8 @@
   window.addEventListener('load', function () {
     menuEl = $('menu'); listEl = $('mlist'); gameEl = $('game');
     gstat = $('gstat'); cv = $('gc');
+    ovlEl = $('ovl'); olistEl = $('olist'); ostatEl = $('ostat');
+    otitleEl = $('otitle'); ohintEl = $('ohint');
     ctx = cv.getContext('2d');
     $('mver').textContent = 'v' + VER;
     /* No editable element exists in this app on purpose: while a text field
