@@ -40,8 +40,11 @@ adb root && adb wait-for-device
 ```
 
 `install.sh` pushes everything, registers the app, restarts the phone's UI and
-verifies that the app is being served. It needs no build tools: the armv7
-binaries are in `prebuilt/armv7/`.
+verifies that the app is being served. No compiler or NDK is needed: the three
+armv7 binaries (`n64play_gl`, `n64svc`, `n64boot`) are committed in
+`prebuilt/armv7/`. Packaging the web app (`./pack.sh`, which `install.sh` calls
+itself) needs `python3` and `zip` on the host; `n64.zip` is a build product and
+is not committed.
 
 Then copy ROMs to the phone:
 
