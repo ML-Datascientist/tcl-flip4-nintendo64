@@ -28,7 +28,7 @@
   'use strict';
   var API = 'http://127.0.0.1:8090';
   var EWS = 'ws://127.0.0.1:8081/';
-  var VER = '1.3.1';                 /* pack.sh rewrites to manifest version */
+  var VER = '1.3.2';                 /* pack.sh rewrites to manifest version */
 
   var menuEl, listEl, gameEl, gstat, cv, ctx;
   var mode = 'menu';
@@ -638,12 +638,14 @@
         ostatus('key map reset');
       }));
     } else {
-      var kind = ovView;
-      for (i = 1; i <= SLOTS; i++) (function (n, ts) {
+      /* wire command letter: the daemon takes "S<n>"/"G<n>" only, while the
+       * view names are the words 'save'/'load' */
+      var kind = (ovView === 'save') ? 'S' : 'G';
+      for (i = 1; i <= SLOTS; i++) (function (n, ts, k) {
         olistEl.appendChild(ovBtn('Slot ' + n + '   ' + fmtSlot(ts),
-                                  kind === 'load' && !ts,
-                                  function () { doSlot(kind, n); }));
-      })(i, ovSlots[i - 1] || 0);
+                                  k === 'G' && !ts,
+                                  function () { doSlot(k, n); }));
+      })(i, ovSlots[i - 1] || 0, kind);
     }
     setTimeout(function () { focusRow(ovFocus); }, 20);
   }

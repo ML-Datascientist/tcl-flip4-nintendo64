@@ -149,6 +149,12 @@ paint pre-load frames over the restored scene. On this phone a save takes
 ~0.3 s and a load ~0.1 s (`n64play: state save|load slot N ok` in the emulator
 log).
 
+The page speaks the daemon's wire commands directly — `L` lists, `S<n>` saves,
+`G<n>` loads, and the reply is `SV|LD <n> ok|err`. `n64.log` therefore shows
+`state SV 3 ok` / `state LD 1 ok` per action. (v1.3.0 renamed the overlay views
+to words and briefly sent `save3` instead of `S3`, which the daemon ignores —
+fixed in v1.3.2, where the rows carry the command letter again.)
+
 ### Orientation (v1.2.0)
 
 Menu → **Orientation** offers **Landscape** (default) and **Portrait**; the
@@ -418,6 +424,7 @@ default mapping, so the frontend feeds that device from pad bits 12–15.
 | no sound | it starts muted — press `0` (the daemon logs `n64play: audio on` and the app logs `sound on`); `no AudioContext` in `n64.log` means Gecko refused the context, so tap `0` again after a key press |
 | save/load menu says `emulator link down` | the WebSocket is down — the overlay still opens, but slots cannot be read or written; Back to resume, the app reconnects (see `retry` rows above) |
 | `save failed` / `load failed` | the daemon refused: `grep "state save\|state load" /data/local/tmp/n64play_gl.log` says why (open/write error, size mismatch after a core change, short read). A slot from an older core build is rejected on purpose — states are not portable across builds |
+| Save state / Load state does nothing and then says `no reply from the emulator` | the app sent something the daemon does not parse: `grep "state " /data/local/tmp/n64.log` shows the `SV|LD` acks it got — an empty result means the daemon never saw `S<n>`/`G<n>` (regression from v1.3.0, fixed in v1.3.2) |
 | menu shows `empty` for a slot that was saved | the app and the daemon are talking about different ROM paths: slot files are named after the ROM file plus a hash of its full path, so moving/renaming the ROM starts a fresh set (`ls /data/local/n64/states`) |
 | a button stopped responding | it was remapped (or its key traded away): menu → Key mapping, or `Reset to defaults`; `map …` in `n64.log` shows the loaded map |
 | sound is on again after a relaunch | that is the stored preference (`n64.sound`), not a regression — menu → Sound → Off, or press `0` |
