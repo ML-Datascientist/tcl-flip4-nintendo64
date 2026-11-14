@@ -28,7 +28,7 @@
   'use strict';
   var API = 'http://127.0.0.1:8090';
   var EWS = 'ws://127.0.0.1:8081/';
-  var VER = '1.3.0';                 /* pack.sh rewrites to manifest version */
+  var VER = '1.3.1';                 /* pack.sh rewrites to manifest version */
 
   var menuEl, listEl, gameEl, gstat, cv, ctx;
   var mode = 'menu';
@@ -627,6 +627,7 @@
         olistEl.appendChild(ovBtn(padLabel(btnLabel(b)) + (key ? keyName(key) : '-'), 0,
           function () {
             mapCapture = b;
+            mapArm = 0;             /* only a press after the keyup counts */
             renderOvl();
             ostatus('press a key for ' + b);
           }));
@@ -651,6 +652,7 @@
     ovView = v;
     ovFocus = 0;
     mapCapture = '';
+    mapArm = 0;
     ostatus('');
     renderOvl();
     if (v === 'save' || v === 'load') stList();   /* fresh timestamps when slots show */
@@ -720,6 +722,7 @@
     ovFocus = 0;
     ovSlots = [];
     mapCapture = '';
+    mapArm = 0;
     document.body.className = 'playing overlaying';
     ovlEl.className = 'on';
     renderOvl();
@@ -732,6 +735,7 @@
     ovOpen = false;
     ovBusy = 0;
     mapCapture = '';
+    mapArm = 0;
     clearTimeout(ovTimer);
     if (ovlEl) ovlEl.className = '';
     if (mode === 'game') document.body.className = 'playing';
@@ -753,11 +757,27 @@
   function ovKey(k, e) {
     if (e.type !== 'keydown') return;
     if (mapCapture) {                    /* waiting for the key to assign */
-      if (e.repeat) return;
       if (k === 'Backspace' || k === 'BrowserBack' || k === 'Escape' || k === 'SoftRight') {
+        if (e.repeat) return;
         mapCapture = '';
+        mapArm = 0;
         renderOvl();
         ostatus('cancelled');
+        return;
+      }
+      /* The OK key on this phone sends Enter and then a phantom
+       * MicrophoneToggle keydown (n64.log: "gk Enter" immediately followed
+       * by "gk MicrophoneToggle" on every OK press). It is a system key, not
+       * a pad key: swallow it, and treat it as the end of the OK press.
+       * Everything else is ignored until the keyup of the press that opened
+       * this capture, so that press can never assign itself. */
+      if (k === 'MicrophoneToggle') {
+        mapArm = 1;
+        log('map capture: phantom key ignored');
+        return;
+      }
+      if (e.repeat || !mapArm) {
+        log('map capture: ' + k + ' ignored (key not released yet)');
         return;
       }
       if (ARROWS_LAND[k] !== undefined) {
@@ -770,6 +790,7 @@
       }
       var b = mapCapture;
       mapCapture = '';
+      mapArm = 0;
       assignKey(b, k);
       renderOvl();
       ostatus(b + ' = ' + keyName(k));
@@ -829,7 +850,7 @@
     'C-left': '7', 'C-right': '9', Up: '8', Down: '5', Left: '4', Right: '6'
   };
   var FIXED_BITS = { '#': 11 };
-  var MAP = {}, keyMap = {}, mapCapture = '';
+  var MAP = {}, keyMap = {}, mapCapture = '', mapArm = 0;
 
   function padLabel(s) { while (s.length < 12) s += ' '; return s; }
 
@@ -985,6 +1006,7 @@
 
   function keyup(e) {
     if (mode !== 'game') return;
+    if (mapCapture && !mapArm) mapArm = 1;   /* the press that opened the capture is done */
     e.preventDefault(); e.stopPropagation();
     if (ovOpen) return;                  /* overlay: pad already released */
     var bit = keyBit(e.key);

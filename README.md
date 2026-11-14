@@ -259,6 +259,12 @@ you press becomes that button's key and the status line confirms (`A = 6`).
 * `0` — the sound toggle; the right soft key — the menu;
 * `#` keeps its legacy second-Z binding (bit 11) unless you assign `#` itself.
 
+The capture only accepts a key pressed **after** the OK key is released, and it
+drops the extra keydown this phone sends with every OK press: n64.log shows
+`gk Enter` immediately followed by `gk MicrophoneToggle`, so without that guard
+the capture assigned itself `MicrophoneToggle` the moment it opened (fixed in
+v1.3.1). Pressing OK a second time, deliberately, still assigns `OK`.
+
 One key drives one button: assigning a key that another button already holds
 **trades** the two keys, so a remap can never leave a button dead
 (`map A=6 (traded with Right)` in `n64.log`). The map is stored in
