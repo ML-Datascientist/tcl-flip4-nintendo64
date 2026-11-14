@@ -229,7 +229,7 @@ Software-RDP fallback (if the GPU path ever fails):
 | `prebuilt/armv7/` | armv7 PIE binaries `install.sh` pushes (no NDK needed to install) |
 | `install.sh`, `uninstall.sh`, `pack.sh`, `build.sh` | deploy / remove / package / build helpers |
 
-`prebuilt/armv7/n64play_gl` (5.6 MB, stripped, libstdc++ linked statically) is
+`prebuilt/armv7/n64play_gl` (4.3 MB stripped, libstdc++ linked statically) is
 built from the three local files in `daemon/` plus the upstream core. The
 upstream snapshot it was built from is pinned by sha256 in
 `daemon/nx.tar.gz.sha256`; `daemon/build_gl.sh` refuses any other tarball, so a
