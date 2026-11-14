@@ -28,7 +28,7 @@
   'use strict';
   var API = 'http://127.0.0.1:8090';
   var EWS = 'ws://127.0.0.1:8081/';
-  var VER = '1.2.0';                 /* pack.sh rewrites to manifest version */
+  var VER = '1.3.0';                 /* pack.sh rewrites to manifest version */
 
   var menuEl, listEl, gameEl, gstat, cv, ctx;
   var mode = 'menu';
@@ -523,8 +523,13 @@
       aqWf = aqRf = 0; ffrac = 0; armed = false;
       if (actx && actx.suspend) actx.suspend();
     }
+    try { localStorage.setItem('n64.sound', soundOn ? '1' : '0'); } catch (e) {}
     log('sound ' + (soundOn ? 'on' : 'off'));
     setStatus(soundOn ? 'SOUND ON' : 'SOUND OFF', true);
+  }
+
+  function loadSound() {
+    try { if (localStorage.getItem('n64.sound') === '1') setSound(true); } catch (e) {}
   }
 
   function closeAudio() {
@@ -541,15 +546,20 @@
   var SLOTS = 5;
   var ovlEl, olistEl, ostatEl, otitleEl, ohintEl;
   var ovOpen = false, ovBusy = 0, ovTimer = 0, ovSlots = [];
-  var ovView = 'root';                /* 'root' | 'S' (save) | 'G' (load) | 'O' */
+  var ovView = 'root';                /* root | save | load | orient | sound | map */
   var ovFocus = 0;                    /* focused row index inside the view */
 
-  var OV_TITLE = { root: 'MENU', S: 'SAVE STATE', G: 'LOAD STATE', O: 'ORIENTATION' };
+  var OV_TITLE = {
+    root: 'MENU', save: 'SAVE STATE', load: 'LOAD STATE',
+    orient: 'ORIENTATION', sound: 'SOUND', map: 'KEY MAPPING'
+  };
   var OV_HINT = {
     root: 'OK select \u00b7 Back resume',
-    S: 'OK save into slot \u00b7 Back menu',
-    G: 'OK load slot \u00b7 Back menu',
-    O: 'OK set \u00b7 Back menu'
+    save: 'OK save into slot \u00b7 Back menu',
+    load: 'OK load slot \u00b7 Back menu',
+    orient: 'OK set \u00b7 Back menu',
+    sound: 'OK set \u00b7 Back menu',
+    map: 'OK change key \u00b7 Back menu'
   };
 
   function ostatus(t) { if (ostatEl) ostatEl.textContent = t || ''; }
@@ -582,13 +592,16 @@
     if (!olistEl) return;
     var i;
     olistEl.textContent = '';
+    olistEl.className = (ovView === 'map') ? 'dense' : '';
     otitleEl.textContent = OV_TITLE[ovView];
-    ohintEl.textContent = OV_HINT[ovView];
+    ohintEl.textContent = mapCapture ? 'press a key \u00b7 Back cancel' : OV_HINT[ovView];
     if (ovView === 'root') {
-      olistEl.appendChild(ovBtn('Load state', 0, function () { enterView('G'); }));
-      olistEl.appendChild(ovBtn('Save state', 0, function () { enterView('S'); }));
-      olistEl.appendChild(ovBtn('Orientation', 0, function () { enterView('O'); }));
-    } else if (ovView === 'O') {
+      olistEl.appendChild(ovBtn('Load state', 0, function () { enterView('load'); }));
+      olistEl.appendChild(ovBtn('Save state', 0, function () { enterView('save'); }));
+      olistEl.appendChild(ovBtn('Orientation', 0, function () { enterView('orient'); }));
+      olistEl.appendChild(ovBtn('Sound', 0, function () { enterView('sound'); }));
+      olistEl.appendChild(ovBtn('Key mapping', 0, function () { enterView('map'); }));
+    } else if (ovView === 'orient') {
       var modes = [['land', 'Landscape'], ['port', 'Portrait']];
       for (i = 0; i < modes.length; i++) (function (v, label) {
         olistEl.appendChild(ovBtn(label + (orient === v ? '   (on)' : ''), 0,
@@ -598,11 +611,36 @@
             ostatus('orientation: ' + label.toLowerCase());
           }));
       })(modes[i][0], modes[i][1]);
+    } else if (ovView === 'sound') {
+      var snd = [[1, 'On'], [0, 'Off']];
+      for (i = 0; i < snd.length; i++) (function (v, label) {
+        olistEl.appendChild(ovBtn(label + (soundOn === !!v ? '   (on)' : ''), 0,
+          function () {
+            setSound(v);
+            renderOvl();
+            ostatus('sound: ' + label.toLowerCase());
+          }));
+      })(snd[i][0], snd[i][1]);
+    } else if (ovView === 'map') {
+      for (i = 0; i < BTN_ORDER.length; i++) (function (b) {
+        var key = MAP[b];
+        olistEl.appendChild(ovBtn(padLabel(btnLabel(b)) + (key ? keyName(key) : '-'), 0,
+          function () {
+            mapCapture = b;
+            renderOvl();
+            ostatus('press a key for ' + b);
+          }));
+      })(BTN_ORDER[i]);
+      olistEl.appendChild(ovBtn('Reset to defaults', 0, function () {
+        resetMap();
+        renderOvl();
+        ostatus('key map reset');
+      }));
     } else {
       var kind = ovView;
       for (i = 1; i <= SLOTS; i++) (function (n, ts) {
         olistEl.appendChild(ovBtn('Slot ' + n + '   ' + fmtSlot(ts),
-                                  kind === 'G' && !ts,
+                                  kind === 'load' && !ts,
                                   function () { doSlot(kind, n); }));
       })(i, ovSlots[i - 1] || 0);
     }
@@ -612,9 +650,10 @@
   function enterView(v) {
     ovView = v;
     ovFocus = 0;
+    mapCapture = '';
     ostatus('');
     renderOvl();
-    if (v === 'S' || v === 'G') stList();   /* fresh timestamps when slots show */
+    if (v === 'save' || v === 'load') stList();   /* fresh timestamps when slots show */
   }
 
   function stList() {
@@ -680,6 +719,7 @@
     ovView = 'root';
     ovFocus = 0;
     ovSlots = [];
+    mapCapture = '';
     document.body.className = 'playing overlaying';
     ovlEl.className = 'on';
     renderOvl();
@@ -691,6 +731,7 @@
     if (!ovOpen) return;
     ovOpen = false;
     ovBusy = 0;
+    mapCapture = '';
     clearTimeout(ovTimer);
     if (ovlEl) ovlEl.className = '';
     if (mode === 'game') document.body.className = 'playing';
@@ -711,6 +752,29 @@
 
   function ovKey(k, e) {
     if (e.type !== 'keydown') return;
+    if (mapCapture) {                    /* waiting for the key to assign */
+      if (e.repeat) return;
+      if (k === 'Backspace' || k === 'BrowserBack' || k === 'Escape' || k === 'SoftRight') {
+        mapCapture = '';
+        renderOvl();
+        ostatus('cancelled');
+        return;
+      }
+      if (ARROWS_LAND[k] !== undefined) {
+        ostatus('arrows stay on the stick — pick another key');
+        return;
+      }
+      if (k === '0') {
+        ostatus('0 is the sound key — pick another key');
+        return;
+      }
+      var b = mapCapture;
+      mapCapture = '';
+      assignKey(b, k);
+      renderOvl();
+      ostatus(b + ' = ' + keyName(k));
+      return;
+    }
     if (k === 'Backspace' || k === 'BrowserBack' || k === 'Escape' || k === 'SoftRight') {
       ovBack();
       return;
@@ -733,20 +797,14 @@
   /* Landscape (default): the phone is held rotated counter-clockwise (keypad
    * on the right), so the arrow cross is remapped to match the rotated
    * picture. Portrait: the picture is upright, so arrows use the natural
-   * directions — exactly the four bits the dialer keys 8/4/5/6 send anyway.
-   * Numeric keys, OK, the soft keys, `*`, `#` and Back never depend on
-   * orientation. keyup() resolves bits through the same table, so a press can
-   * never stick; setOrient() also drops every held bit. */
-  /* SoftRight is NOT a pad bit any more: it opens the menu (openOvl). N64 R
-   * moved to SoftLeft (top-left button) so the phone keeps every N64 button. */
+   * directions. The arrow keys are the d-pad and are NOT remappable; every
+   * other pad key is user-assignable (menu -> Key mapping). keyup() resolves
+   * bits through the same path, so a press can never stick; setOrient() and
+   * reassigning a key also drop every held bit. */
+  /* SoftRight is NOT a pad bit: it opens the menu (openOvl). N64 R moved to
+   * SoftLeft (top-left button) so the phone keeps every N64 button. */
   var orient = 'land';                /* 'land' | 'port' */
-  var KEYBITS = {
-    '8': 4, '4': 6, '5': 5, '6': 7,
-    Enter: 3, '1': 0, '2': 1, '3': 8,
-    '7': 12, '9': 13,
-    '*': 2, '#': 11,
-    SoftLeft: 10
-  };
+
   var ARROWS_LAND = {
     ArrowUp: 6, ArrowLeft: 5, ArrowDown: 7, ArrowRight: 4,
     Up: 6, Left: 5, Down: 7, Right: 4
@@ -756,10 +814,87 @@
     Up: 4, Left: 6, Down: 5, Right: 7
   };
 
+  /* One entry per N64 button and the pad bit it sets (daemon pad_bit). */
+  var BTN_BIT = {
+    B: 0, A: 1, L: 2, Start: 3,
+    Up: 4, Down: 5, Left: 6, Right: 7,
+    Z: 8, R: 10, 'C-left': 12, 'C-right': 13
+  };
+  var BTN_ORDER = ['A', 'B', 'Z', 'L', 'R', 'Start', 'C-left', 'C-right',
+                   'Up', 'Down', 'Left', 'Right'];
+  /* Defaults are the v1.2.0 map unchanged, one phone key per button. `#` is a
+   * legacy second Z key (bit 11) and stays an alias unless it gets remapped. */
+  var MAP_DEF = {
+    A: '2', B: '1', Z: '3', L: '*', R: 'SoftLeft', Start: 'Enter',
+    'C-left': '7', 'C-right': '9', Up: '8', Down: '5', Left: '4', Right: '6'
+  };
+  var FIXED_BITS = { '#': 11 };
+  var MAP = {}, keyMap = {}, mapCapture = '';
+
+  function padLabel(s) { while (s.length < 12) s += ' '; return s; }
+
+  function btnLabel(b) {
+    return (b === 'Up' || b === 'Down' || b === 'Left' || b === 'Right')
+      ? 'Stick ' + b : b;
+  }
+
+  function keyName(k) {
+    if (k === 'Enter') return 'OK';
+    if (k === 'SoftLeft') return 'L-Soft';
+    if (k === 'SoftRight') return 'R-Soft';
+    if (k === 'Backspace' || k === 'BrowserBack') return 'Back';
+    return k;
+  }
+
+  function rebuildKeyMap() {
+    var b;
+    keyMap = {};
+    for (b in MAP) if (MAP[b]) keyMap[MAP[b]] = b;   /* key -> N64 button */
+  }
+
+  function loadMap() {
+    var saved = null, i, b;
+    try { saved = JSON.parse(localStorage.getItem('n64.map') || 'null'); } catch (e) {}
+    MAP = {};
+    for (i = 0; i < BTN_ORDER.length; i++) {
+      b = BTN_ORDER[i];
+      /* '' is a real value (a button whose key was taken); only a missing
+       * entry falls back to the default */
+      MAP[b] = (saved && typeof saved[b] === 'string') ? saved[b] : MAP_DEF[b];
+    }
+    rebuildKeyMap();
+    log('map ' + BTN_ORDER.map(function (x) { return x + '=' + MAP[x]; }).join(' '));
+  }
+
+  function saveMap() {
+    try { localStorage.setItem('n64.map', JSON.stringify(MAP)); } catch (e) {}
+    rebuildKeyMap();
+  }
+
+  function resetMap() {
+    var i;
+    for (i = 0; i < BTN_ORDER.length; i++) MAP[BTN_ORDER[i]] = MAP_DEF[BTN_ORDER[i]];
+    saveMap();
+    log('map reset');
+  }
+
+  /* One key drives one button. If the key already belongs to another button
+   * the two trade keys, so a remap never leaves a button dead. */
+  function assignKey(b, k) {
+    var old = MAP[b] || '', owner = '', x;
+    for (x in MAP) if (x !== b && MAP[x] === k) owner = x;
+    MAP[b] = k;
+    if (owner) MAP[owner] = old;
+    saveMap();
+    if (pad) { pad = 0; sendPad(); }
+    log('map ' + b + '=' + k + (owner ? ' (traded with ' + owner + ')' : ''));
+  }
+
   function keyBit(k) {
     var a = orient === 'port' ? ARROWS_PORT : ARROWS_LAND;
     if (a[k] !== undefined) return a[k];
-    return KEYBITS[k];
+    if (keyMap[k] !== undefined) return BTN_BIT[keyMap[k]];
+    return FIXED_BITS[k];
   }
 
   function loadOrient() {
@@ -929,6 +1064,8 @@
       if (document.mozHidden) releaseAll();
     });
     loadOrient();            /* landscape unless the menu stored portrait */
+    loadMap();               /* custom key map, defaults otherwise */
+    loadSound();             /* muted unless the menu stored sound on */
     showMenu();
   });
 })();

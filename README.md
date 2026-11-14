@@ -70,14 +70,14 @@ normally and the arrows become the plain directions.
 | key | N64 | action |
 |---|---|---|
 | arrows | Control Stick | move (full deflection = run) — landscape: the cross follows the rotated picture (`ArrowUp`=left on screen, `ArrowRight`=up); portrait: plain directions |
-| `8` `4` `5` `6` | Control Stick | same four screen directions in **both** orientations |
+| `8` `4` `5` `6` | Control Stick | same four screen directions in **both** orientations (defaults — remappable) |
 | `2` | A | jump |
 | `1` | B | punch / attack |
 | `3` or `#` | Z | crouch / ground pound |
 | `7` / `9` | C-left / C-right | rotate camera |
 | `*` | L | camera recentre |
 | left soft key | R | (was the right soft key before v1.0.9) |
-| right soft key | | menu: Load state / Save state / Orientation |
+| right soft key | | menu: Load state / Save state / Orientation / Sound / Key mapping |
 | OK | Start | |
 | `0` | | sound on/off (**starts muted**) |
 | Back | | stop the game, back to the ROM list |
@@ -111,14 +111,15 @@ message page before the stick responds.
 ### Save states (v1.0.9, two-page menu in v1.1.0)
 
 The **right soft key** (top-right, above the end-call key) opens an overlay
-while the game keeps running. Page one has three entries (title `MENU` since
-v1.2.0, when Orientation joined them):
+while the game keeps running. Page one is the `MENU`:
 
 ```
 MENU
   Load state
   Save state
   Orientation
+  Sound
+  Key mapping
 ```
 
 **OK** opens the selected page. Load/Save show that page's five slots:
@@ -204,11 +205,19 @@ a key for them, so the latch described above does not apply.
 ### Sound
 
 Sound starts **muted** (v1.0.8): the loading screen is the most fragile part of
-a session and PCM is the one thing it does not need. Press `0` in-game to turn it
-on — that keydown is the user gesture Gecko wants, so the `AudioContext` is
-created there, and the app sends `A1` on the live socket; `0` again sends `A0`,
-which makes the daemon stop producing PCM entirely (735 stereo frames per batch,
-`MDA` + 4-byte header, while on).
+a session and PCM is the one thing it does not need. Turn it on either with `0`
+in-game or with **menu → Sound → On** (v1.3.0); both run the same `setSound()`,
+which sends `A1` on the live socket. `Off` (or `0` again) sends `A0`, which makes
+the daemon stop producing PCM entirely (735 stereo frames per batch, `MDA` +
+4-byte header, while on).
+
+The menu page shows the current state (`On` / `Off   (on)`) and the choice is
+stored in `localStorage` (`n64.sound`), so a relaunch keeps it; a fresh install
+starts muted. With sound stored on, the app calls `setSound(true)` at boot: the
+`AudioContext` may start suspended until the first key press (Gecko only resumes
+it on a user gesture — the in-game `keydown` handler does that), and the daemon
+starts sending PCM as soon as the socket opens. `0` always remains a toggle and
+writes the same preference.
 
 Audio never blocks video. The daemon writes every socket message non-blocking
 and keeps two drop-oldest queues (a single video-frame slot and a 512 KiB PCM
@@ -217,6 +226,47 @@ old PCM is discarded (`vdrop=`/`adrop=` in the daemon log) instead of the daemon
 blocking on a full socket buffer and losing the session. The app decodes each
 batch with one `Int16Array` view over the received buffer and keeps O(1) ring
 bookkeeping, so a slow renderer costs dropped audio, not a dropped link.
+
+### Key mapping (v1.3.0)
+
+**menu → Key mapping** lists every N64 button with the phone key that sets it.
+The defaults are the pad map this app has always had:
+
+```
+KEY MAPPING
+A           2
+B           1
+Z           3
+L           *
+R           L-Soft
+Start       OK
+C-left      7
+C-right     9
+Stick Up    8
+Stick Down  5
+Stick Left  4
+Stick Right 6
+Reset to defaults
+```
+
+**OK** on a row starts the capture (`press a key · Back cancel`); the next key
+you press becomes that button's key and the status line confirms (`A = 6`).
+**Back** cancels the capture. What is not assignable, and why:
+
+* **arrows** — they are the d-pad and stay on the stick in both orientations
+  (see [Orientation](#orientation-v120)); pressing one during the capture says
+  `arrows stay on the stick`;
+* `0` — the sound toggle; the right soft key — the menu;
+* `#` keeps its legacy second-Z binding (bit 11) unless you assign `#` itself.
+
+One key drives one button: assigning a key that another button already holds
+**trades** the two keys, so a remap can never leave a button dead
+(`map A=6 (traded with Right)` in `n64.log`). The map is stored in
+`localStorage` (`n64.map`) and applied at boot — the log line
+`map A=2 B=1 Z=3 …` shows exactly what was loaded — and
+`Reset to defaults` restores the table above. Keys are still read from
+`keydown`/`keyup` through one lookup (`keyBit()`), so a remapped key is held and
+released exactly like before.
 
 ### Screen timeout
 
@@ -363,6 +413,8 @@ default mapping, so the frontend feeds that device from pad bits 12–15.
 | save/load menu says `emulator link down` | the WebSocket is down — the overlay still opens, but slots cannot be read or written; Back to resume, the app reconnects (see `retry` rows above) |
 | `save failed` / `load failed` | the daemon refused: `grep "state save\|state load" /data/local/tmp/n64play_gl.log` says why (open/write error, size mismatch after a core change, short read). A slot from an older core build is rejected on purpose — states are not portable across builds |
 | menu shows `empty` for a slot that was saved | the app and the daemon are talking about different ROM paths: slot files are named after the ROM file plus a hash of its full path, so moving/renaming the ROM starts a fresh set (`ls /data/local/n64/states`) |
+| a button stopped responding | it was remapped (or its key traded away): menu → Key mapping, or `Reset to defaults`; `map …` in `n64.log` shows the loaded map |
+| sound is on again after a relaunch | that is the stored preference (`n64.sound`), not a regression — menu → Sound → Off, or press `0` |
 | picture has black bars above and below | the app is in **portrait** orientation (240×180 in a 240×320 window); menu → Orientation → Landscape for the full-screen rotated view |
 | arrows point the wrong way | arrow bits depend on the orientation (see [Orientation](#orientation-v120)): `gk ArrowUp->6` is landscape, `->4` is portrait; switching orientation releases every held bit |
 | screen dims after ~15 s | wake lock not held: check `grep wakelock /data/local/tmp/n64.log`; re-run `./install.sh` (grants `wakeLock`/`power`) and restart the app |
